@@ -8,6 +8,7 @@
 		"url": "git+https://github.com/pi-dal/pi-proxy-guard.git"
 	},
 	"type": "module",
+	"files": ["extensions", "README.md", "LICENSE"],
 	"keywords": ["pi-package"],
 	"pi": {
 		"extensions": ["./extensions/proxy-guard.ts"]
