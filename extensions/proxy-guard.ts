@@ -32,6 +32,11 @@
  * Env knobs (defaults):
  *   PI_PROXY_GUARD=0                     disable
  *   PI_PROXY_GUARD_URL                   https://www.google.com/generate_204
+ *                                        (cheap ping used by the watchdog)
+ *   PI_PROXY_GUARD_API_URL               (unset = use ctx.model.baseUrl)
+ *   PI_PROXY_GUARD_STREAM_URL            https://speed.cloudflare.com/__down?bytes=65536
+ *   PI_PROXY_GUARD_STREAM_MIN_BYTES      60000  (0 disables transfer probe)
+ *   PI_PROXY_GUARD_VPN_SERVICE           ""    (scutil --nc fast-path name)
  *   PI_PROXY_GUARD_PROXY                 (unset = inherit env proxy vars)
  *   PI_PROXY_GUARD_TIMEOUT_MS            20000
  *   PI_PROXY_GUARD_PROBE_ATTEMPTS        2   (down requires N consecutive fails)
@@ -70,6 +75,10 @@ import { setTimeout as sleep } from "node:timers/promises";
 
 const DISABLED = process.env.PI_PROXY_GUARD === "0";
 const CHECK_URL = process.env.PI_PROXY_GUARD_URL ?? "https://www.google.com/generate_204";
+const API_URL_OVERRIDE = process.env.PI_PROXY_GUARD_API_URL;
+const STREAM_URL = process.env.PI_PROXY_GUARD_STREAM_URL ?? "https://speed.cloudflare.com/__down?bytes=65536";
+const STREAM_MIN_BYTES = Number(process.env.PI_PROXY_GUARD_STREAM_MIN_BYTES ?? 60_000);
+const VPN_SERVICE = process.env.PI_PROXY_GUARD_VPN_SERVICE ?? "";
 const CHECK_PROXY = process.env.PI_PROXY_GUARD_PROXY;
 const CHECK_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_TIMEOUT_MS ?? 20_000);
 const PROBE_ATTEMPTS = Number(process.env.PI_PROXY_GUARD_PROBE_ATTEMPTS ?? 2);
@@ -132,25 +141,66 @@ interface CheckResult {
 	error?: string;
 }
 
-function checkProxy(): Promise<CheckResult> {
+function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; output?: string; error?: string }> {
+	return new Promise((resolve) => {
+		execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+			resolve(err
+				? { ok: false, output: stdout, error: ((stderr || "") + err.message).split("\n")[0].trim() }
+				: { ok: true, output: stdout });
+		});
+	});
+}
+
+/** Reachability probe: any HTTP response (even 404/401/502) means the
+ *  transport path to the host is alive — that's what we measure, not
+ *  whether the endpoint "succeeds". */
+function httpProbe(url: string): Promise<CheckResult> {
 	return new Promise((resolve) => {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
 		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
-		args.push(CHECK_URL);
+		args.push(url);
 		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000 }, (err, stdout) => {
 			const status = Number.parseInt((stdout ?? "").trim(), 10);
-			if (!err && status >= 200 && status < 400) resolve({ ok: true, status });
+			if (!err && status > 0) resolve({ ok: true, status });
 			else resolve({ ok: false, status: Number.isFinite(status) ? status : undefined, error: (err?.message ?? "").split("\n")[0] });
 		});
 	});
 }
 
-function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; error?: string }> {
+/** Sustained-transfer probe: downloads STREAM_URL and requires the body to
+ *  actually arrive (>= STREAM_MIN_BYTES). A half-dead chain that passes tiny
+ *  pings but cuts long-lived streams gets caught here. */
+function streamProbe(url: string): Promise<CheckResult> {
 	return new Promise((resolve) => {
-		execFile(cmd, args, { timeout: timeoutMs }, (err, _stdout, stderr) => {
-			resolve(err ? { ok: false, error: ((stderr || "") + err.message).split("\n")[0].trim() } : { ok: true });
+		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code} %{size_download}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
+		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
+		args.push(url);
+		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000 }, (err, stdout) => {
+			const [statusRaw, bytesRaw] = (stdout ?? "").trim().split(/\s+/);
+			const status = Number.parseInt(statusRaw, 10);
+			const bytes = Number.parseInt(bytesRaw, 10);
+			if (!err && status > 0 && bytes >= STREAM_MIN_BYTES) resolve({ ok: true, status });
+			else
+				resolve({
+					ok: false,
+					status: Number.isFinite(status) ? status : undefined,
+					error: err ? err.message.split("\n")[0] : `stream cut: got ${bytes}B < ${STREAM_MIN_BYTES}B`,
+				});
 		});
 	});
+}
+
+/** Optional fast path: the VPN tunnel state itself, zero network traffic. */
+async function tunnelUp(): Promise<boolean | undefined> {
+	if (!VPN_SERVICE) return undefined;
+	const r = await execCmd("scutil", ["--nc", "show", VPN_SERVICE], 5_000);
+	if (!r.ok || r.output === undefined) return undefined;
+	return /\bConnected\b/.test(r.output) ? true : /\bDisconnected\b/.test(r.output) ? false : undefined;
+}
+
+/** Back-compat shim: reachability via the configured CHECK_URL. */
+function checkProxy(): Promise<CheckResult> {
+	return httpProbe(CHECK_URL);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -245,11 +295,24 @@ export default function (pi: ExtensionAPI) {
 	 *  A single failure never means "down" on a wobbly chain proxy — we
 	 *  require PROBE_ATTEMPTS consecutive failures before declaring dead.
 	 *  This prevents latency spikes from triggering needless VPN bounces
-	 *  (which would kill the very streams we're trying to protect). */
-	async function probe(): Promise<CheckResult> {
+	 *  (which would kill the very streams we're trying to protect).
+	 *
+	 *  deep=true (settle/recheck): probes the actual API host (ctx.model.baseUrl
+	 *  or PI_PROXY_GUARD_API_URL) and adds a sustained-transfer check — the
+	 *  "can it hold an SSE stream" signal a 0-byte ping can't see.
+	 *  deep=false (watchdog): cheap generate_204 ping only. */
+	async function probe(ctx?: ExtensionContext, deep = false): Promise<CheckResult> {
+		const vpn = await tunnelUp();
+		if (vpn === false) return { ok: false, error: `VPN tunnel "${VPN_SERVICE}" disconnected` };
+
+		const target = (deep ? (API_URL_OVERRIDE ?? ctx?.model?.baseUrl) : undefined) ?? CHECK_URL;
 		let last: CheckResult = { ok: false };
 		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-			last = await checkProxy();
+			last = await httpProbe(target);
+			if (last.ok && deep && STREAM_MIN_BYTES > 0) {
+				const stream = await streamProbe(STREAM_URL);
+				if (!stream.ok) last = stream;
+			}
 			if (last.ok) {
 				failedRepairs = 0;
 				gaveUpNotified = false;
@@ -278,7 +341,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			const recheck = async (): Promise<boolean> => {
 				await sleep(RECHECK_DELAY_MS);
-				const check = await checkProxy();
+				const check = await probe(ctx, true); // deep: verify real capacity before unpausing
 				if (!check.ok) log(`still down: ${check.error ?? `HTTP ${check.status}`}`);
 				return check.ok;
 			};
@@ -334,7 +397,7 @@ export default function (pi: ExtensionAPI) {
 					if (!runActive && !pausedByUs) return;
 					ticking = true;
 					try {
-						const check = await probe();
+						const check = await probe(sessionCtx, false); // cheap ping for the periodic watch
 						if (check.ok) {
 							// Recovered while paused: resume.
 							if (pausedByUs && !runActive) {
@@ -428,7 +491,7 @@ export default function (pi: ExtensionAPI) {
 				`settle error #${consecutiveErrors}; canContinue=${event.context.canContinue}; ` +
 					`budget=${budgetLeft()}/${MAX_REPAIRS}; pausedByUs=${pausedByUs}`,
 			);
-			const check = await probe();
+			const check = await probe(ctx, true); // deep: API host + sustained transfer
 			const canContinue = budgetLeft() > 0;
 			if (!canContinue) {
 				// Budget is about *provider requests*, not connectivity: still
@@ -454,7 +517,7 @@ export default function (pi: ExtensionAPI) {
 				if (!(await repairProxy(ctx))) {
 					// On the half-dead path the pre-repair check was OK: don't trust the
 					// failed repair to mean we're offline — verify once more.
-					const post = await probe();
+					const post = await probe(ctx, true);
 					if (!post.ok) {
 						pausedByUs = true;
 						notify(ctx, "Proxy still down after repair attempts. Staying paused; watchdog will auto-resume once it's back.", "error");
@@ -486,10 +549,10 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "check";
 			if (sub === "check") {
-				const check = await checkProxy();
+				const check = await probe(ctx, true);
 				notify(
 					ctx,
-					check.ok ? `Proxy OK (HTTP ${check.status}, ${CHECK_URL})` : `Proxy DOWN (${check.error ?? `HTTP ${check.status}`}, ${CHECK_URL})`,
+					check.ok ? `Proxy OK (HTTP ${check.status})` : `Proxy DOWN (${check.error ?? `HTTP ${check.status}`})`,
 					check.ok ? "info" : "error",
 				);
 			} else if (sub === "restart") {
@@ -498,7 +561,8 @@ export default function (pi: ExtensionAPI) {
 			} else if (sub === "status") {
 				notify(
 					ctx,
-					`url=${CHECK_URL} proxy=${CHECK_PROXY ?? "(env)"} shortcut="${SHORTCUT || "off"}" scheme=${USE_SCHEME ? "on" : "off"} ` +
+					`ping=${CHECK_URL} api=${API_URL_OVERRIDE ?? ctx.model?.baseUrl ?? "(none)"} stream=${STREAM_MIN_BYTES > 0 ? STREAM_URL : "off"} vpn=${VPN_SERVICE || "off"} ` +
+						`proxy=${CHECK_PROXY ?? "(env)"} shortcut="${SHORTCUT || "off"}" scheme=${USE_SCHEME ? "on" : "off"} ` +
 						`escalateAfter=${ESCALATE_AFTER} budget=${budgetLeft()}/${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min ` +
 						`watchdog=${WATCHDOG_MS}ms pausedByUs=${pausedByUs} consecErrs=${consecutiveErrors} failedRepairs=${failedRepairs}/${PAUSED_REPAIR_MAX} log=${LOG_FILE || "off"}`,
 				);

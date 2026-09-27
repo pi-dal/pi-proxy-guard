@@ -4,7 +4,7 @@ Auto-recover [pi](https://github.com/earendil-works/pi) sessions when the proxy 
 
 When all provider retries fail (`Retry failed after N attempts` / `Stream ended without finish_reason`), pi pauses the session. This extension:
 
-1. **Checks connectivity** (`curl https://www.google.com/generate_204`, inheriting the same `https_proxy` env pi uses).
+1. **Checks connectivity**, two tiers: the watchdog uses a cheap ping (`generate_204` through the same `https_proxy` env pi uses); at settle/recheck time it does a **deep probe** — API host reachability (`ctx.model.baseUrl`, any HTTP response counts) **plus a sustained-transfer check** (`STREAM_MIN_BYTES` from `STREAM_URL`) — the signal a 0-byte ping can't see: whether the chain can actually hold a streaming connection. 'Down' requires `PROBE_ATTEMPTS` consecutive failures.
 2. **Auto-continues** the run if the proxy is fine (transient stream cut).
 3. **Repairs the proxy** if it's down — runs a macOS Shortcuts shortcut, falls back to `shadowrocket://` URL schemes — then continues once connectivity is verified.
 4. **Watchdog**: if pi is still paused, it keeps watching; once the proxy is verified healthy again it sends `continue` itself. It also repairs the proxy while pi is mid-retry, so many incidents never reach the pause at all.
@@ -64,7 +64,11 @@ Node switching is intentionally left to the proxy client (chain-proxy friendly).
 | Var | Default | Meaning |
 |---|---|---|
 | `PI_PROXY_GUARD` | `1` | `0` disables |
-| `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | health-check target; for tighter signal use your provider's API URL |
+| `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | cheap ping (watchdog ticks) |
+| `PI_PROXY_GUARD_API_URL` | `ctx.model.baseUrl` | deep-probe target; defaults to the active model's API host — any HTTP response counts as reachable |
+| `PI_PROXY_GUARD_STREAM_URL` | `https://speed.cloudflare.com/__down?bytes=65536` | sustained-transfer probe used in deep checks |
+| `PI_PROXY_GUARD_STREAM_MIN_BYTES` | `60000` | min bytes the transfer must deliver; `0` disables it |
+| `PI_PROXY_GUARD_VPN_SERVICE` | _unset_ | `scutil --nc` service name — tunnel-down short-circuits straight to repair |
 | `PI_PROXY_GUARD_PROXY` | _(env)_ | explicit `-x` proxy for the check |
 | `PI_PROXY_GUARD_TIMEOUT_MS` | `20000` | per-attempt check timeout |
 | `PI_PROXY_GUARD_PROBE_ATTEMPTS` | `2` | consecutive failures required to declare "down" — tolerates latency spikes without mis-firing a repair |
