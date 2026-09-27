@@ -73,6 +73,7 @@ Node switching is intentionally left to the proxy client (chain-proxy friendly).
 | `PI_PROXY_GUARD_PAUSED_REPAIRS` | `3` | active repair attempts per down-episode before passive watch |
 | `PI_PROXY_GUARD_NOTIFY` | `macos,bark,webhook` | channels; `0`/`off` disables |
 | `PI_PROXY_GUARD_NOTIFY_RESUME` | `0` | `1` also pushes when the session resumes |
+| `PI_PROXY_GUARD_NOTIFY_FINISH_MS` | `0` | `>0` pushes "Pi finished" only for clean completes lasting ≥ this long — unlike pi-bark, never fires on error settles; e.g. `120000` |
 | `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS` | `600000` | min gap between pushes |
 | `PI_PROXY_GUARD_BARK` | _unset_ | Bark URL incl. device key |
 | `PI_PROXY_GUARD_WEBHOOK` | _unset_ | generic JSON webhook |

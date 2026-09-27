@@ -91,6 +91,10 @@ const NOTIFY_COOLDOWN_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS 
 const BARK = process.env.PI_PROXY_GUARD_BARK ?? "";
 const WEBHOOK = process.env.PI_PROXY_GUARD_WEBHOOK ?? "";
 const PUSH_TITLE = "pi proxy-guard";
+/** Push a "Pi finished" notification only for clean completes lasting >=
+ *  this long. 0 disables. Beats pi-bark's blanket agent_settled push:
+ *  outcome-aware (no false "finished" on error settles) + duration gate. */
+const NOTIFY_FINISH_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_FINISH_MS ?? 0);
 const LOG_FILE =
 	process.env.PI_PROXY_GUARD_LOG !== ""
 		? (process.env.PI_PROXY_GUARD_LOG ?? join(homedir(), ".pi", "agent", "proxy-guard.log"))
@@ -165,6 +169,9 @@ export default function (pi: ExtensionAPI) {
 	let ticking = false;
 	let lastRepairAt = 0;
 	let lastNotifyAt = 0;
+	let runStartedAt = 0;
+	/** outcome of the most recent settle boundary; agent_settled has none. */
+	let lastSettleOutcome = "";
 	/** Session-scoped watchdog + captured context. */
 	let watchdog: ReturnType<typeof setInterval> | undefined;
 	let sessionCtx: ExtensionContext | undefined;
@@ -195,6 +202,16 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		lastNotifyAt = Date.now();
+		pushNow(body);
+	}
+
+	/** Duration-gated finish push; shares channels, unthrottled. */
+	function finishNotify(body: string): void {
+		if (NOTIFY_CHANNELS.length === 0 || NOTIFY_FINISH_MS <= 0) return;
+		pushNow(body);
+	}
+
+	function pushNow(body: string): void {
 		// Machine + cwd prefix, same format as @herbertgao/pi-bark, so pushes
 		// from pi-sync'd machines are attributable at a glance.
 		const full = `\ud83d\udcbb ${hostname()}\n\ud83d\udcc1 ${process.cwd()}\n${body}`;
@@ -358,14 +375,25 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		runActive = true;
+		runStartedAt = Date.now();
 		pausedByUs = false; // whoever started the run, a fresh attempt is underway
 	});
-	pi.on("agent_settled", () => {
+	pi.on("agent_settled", (_event, ctx) => {
 		runActive = false;
+		// Genuine completion (not a failure disguised as "finished", like
+		// pi-bark's blanket settle push) that took a while — worth notifying;
+		// quick interactive turns are not.
+		if (NOTIFY_FINISH_MS > 0 && lastSettleOutcome === "completed" && runStartedAt > 0 && ctx.isIdle()) {
+			const mins = (Date.now() - runStartedAt) / 60_000;
+			if (Date.now() - runStartedAt >= NOTIFY_FINISH_MS) {
+				finishNotify(`Pi finished — run took ${mins.toFixed(1)}min`);
+			}
+		}
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
 		// Clean settle resets both counters: a new incident deserves a full budget.
+		lastSettleOutcome = event.outcome;
 		if (event.outcome !== "error") {
 			repairs = [];
 			consecutiveErrors = 0;
