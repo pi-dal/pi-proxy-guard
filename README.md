@@ -66,7 +66,9 @@ Node switching is intentionally left to the proxy client (chain-proxy friendly).
 | `PI_PROXY_GUARD` | `1` | `0` disables |
 | `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | health-check target; for tighter signal use your provider's API URL |
 | `PI_PROXY_GUARD_PROXY` | _(env)_ | explicit `-x` proxy for the check |
-| `PI_PROXY_GUARD_TIMEOUT_MS` | `10000` | check timeout |
+| `PI_PROXY_GUARD_TIMEOUT_MS` | `20000` | per-attempt check timeout |
+| `PI_PROXY_GUARD_PROBE_ATTEMPTS` | `2` | consecutive failures required to declare "down" — tolerates latency spikes without mis-firing a repair |
+| `PI_PROXY_GUARD_PROBE_GAP_MS` | `1500` | gap between probe attempts |
 | `PI_PROXY_GUARD_SHORTCUT` | `Reconnect Shadowrocket` | `""` disables |
 | `PI_PROXY_GUARD_SCHEME` | `1` | `0` disables `shadowrocket://` fallback |
 | `PI_PROXY_GUARD_ESCALATE_AFTER` | `2` | consecutive errors → repair despite OK ping |

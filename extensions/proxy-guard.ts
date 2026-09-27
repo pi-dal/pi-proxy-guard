@@ -33,7 +33,9 @@
  *   PI_PROXY_GUARD=0                     disable
  *   PI_PROXY_GUARD_URL                   https://www.google.com/generate_204
  *   PI_PROXY_GUARD_PROXY                 (unset = inherit env proxy vars)
- *   PI_PROXY_GUARD_TIMEOUT_MS            10000
+ *   PI_PROXY_GUARD_TIMEOUT_MS            20000
+ *   PI_PROXY_GUARD_PROBE_ATTEMPTS        2   (down requires N consecutive fails)
+ *   PI_PROXY_GUARD_PROBE_GAP_MS          1500 (gap between probe attempts)
  *   PI_PROXY_GUARD_SHORTCUT              "Reconnect Shadowrocket" ("" disables)
  *   PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS   120000
  *   PI_PROXY_GUARD_SCHEME                "1" (shadowrocket:// fallback)
@@ -69,7 +71,9 @@ import { setTimeout as sleep } from "node:timers/promises";
 const DISABLED = process.env.PI_PROXY_GUARD === "0";
 const CHECK_URL = process.env.PI_PROXY_GUARD_URL ?? "https://www.google.com/generate_204";
 const CHECK_PROXY = process.env.PI_PROXY_GUARD_PROXY;
-const CHECK_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_TIMEOUT_MS ?? 10_000);
+const CHECK_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_TIMEOUT_MS ?? 20_000);
+const PROBE_ATTEMPTS = Number(process.env.PI_PROXY_GUARD_PROBE_ATTEMPTS ?? 2);
+const PROBE_GAP_MS = Number(process.env.PI_PROXY_GUARD_PROBE_GAP_MS ?? 1_500);
 const SHORTCUT = process.env.PI_PROXY_GUARD_SHORTCUT ?? "Reconnect Shadowrocket";
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
@@ -237,14 +241,26 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	/** checkProxy + episode bookkeeping: an OK probe resets the repair counter. */
+	/** checkProxy + episode bookkeeping: an OK probe resets the repair counter.
+	 *  A single failure never means "down" on a wobbly chain proxy — we
+	 *  require PROBE_ATTEMPTS consecutive failures before declaring dead.
+	 *  This prevents latency spikes from triggering needless VPN bounces
+	 *  (which would kill the very streams we're trying to protect). */
 	async function probe(): Promise<CheckResult> {
-		const check = await checkProxy();
-		if (check.ok) {
-			failedRepairs = 0;
-			gaveUpNotified = false;
+		let last: CheckResult = { ok: false };
+		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+			last = await checkProxy();
+			if (last.ok) {
+				failedRepairs = 0;
+				gaveUpNotified = false;
+				return last;
+			}
+			if (attempt < PROBE_ATTEMPTS) {
+				log(`probe attempt ${attempt}/${PROBE_ATTEMPTS} failed (${last.error ?? `HTTP ${last.status}`}); retrying`);
+				await sleep(PROBE_GAP_MS);
+			}
 		}
-		return check;
+		return last;
 	}
 
 	/** True while we may still launch an active repair this down-episode. */
