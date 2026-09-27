@@ -279,13 +279,14 @@ export default function (pi: ExtensionAPI) {
 			const viaScheme = async (): Promise<boolean> => {
 				if (!USE_SCHEME) return false;
 				notify(ctx, "Bouncing Shadowrocket via URL scheme…", "warning");
-				const stop = await execCmd("open", [SCHEME_STOP], 15_000);
+				// `open -g`: background — do NOT activate/foreground Shadowrocket.
+				const stop = await execCmd("open", ["-g", SCHEME_STOP], 15_000);
 				if (!stop.ok) {
 					log(`scheme stop failed: ${stop.error}`);
 					return false;
 				}
 				await sleep(3_000);
-				const start = await execCmd("open", [SCHEME_START], 15_000);
+				const start = await execCmd("open", ["-g", SCHEME_START], 15_000);
 				if (!start.ok) {
 					log(`scheme start failed: ${start.error}`);
 					return false;
@@ -315,7 +316,6 @@ export default function (pi: ExtensionAPI) {
 					// Only spend effort when pi actually needs the connection:
 					// a live run (internal retries benefit) or a paused-by-us session.
 					if (!runActive && !pausedByUs) return;
-					if (budgetLeft() <= 0) return;
 					ticking = true;
 					try {
 						const check = await probe();
@@ -341,6 +341,8 @@ export default function (pi: ExtensionAPI) {
 							}
 							return;
 						}
+						// Repairing the network is free — only resumes/continues spend
+						// provider requests, so the budget gates those, not the repair.
 						if (await repairProxy(sessionCtx)) {
 							if (pausedByUs && !runActive && budgetLeft() > 0) {
 								chargeBudget();
@@ -410,13 +412,18 @@ export default function (pi: ExtensionAPI) {
 				`settle error #${consecutiveErrors}; canContinue=${event.context.canContinue}; ` +
 					`budget=${budgetLeft()}/${MAX_REPAIRS}; pausedByUs=${pausedByUs}`,
 			);
-			if (budgetLeft() <= 0) {
+			const check = await probe();
+			const canContinue = budgetLeft() > 0;
+			if (!canContinue) {
+				// Budget is about *provider requests*, not connectivity: still
+				// repair a dead proxy so the user's manual take-over lands on a
+				// working network — then stay paused without continuing.
+				if (!check.ok) await repairProxy(ctx);
 				notify(ctx, `Auto-continue budget exhausted (${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min). Staying paused — take over manually.`, "warning");
 				systemNotify("auto-continue budget exhausted — session paused; check proxy or take over");
+				pausedByUs = true;
 				return;
 			}
-
-			const check = await probe();
 			const halfDead = check.ok && consecutiveErrors >= ESCALATE_AFTER;
 
 			if (!check.ok && !mayRepair()) {

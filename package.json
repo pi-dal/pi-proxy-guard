@@ -1,6 +1,6 @@
 {
 	"name": "pi-proxy-guard",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"description": "Auto-recover pi sessions when the proxy drops: connectivity check, Shadowrocket restart/node-switch via Shortcuts or URL scheme, watchdog auto-resume.",
 	"license": "MIT",
 	"repository": {
