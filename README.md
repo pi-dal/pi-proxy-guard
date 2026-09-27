@@ -38,18 +38,27 @@ pi install ~/Developer/pi-proxy-guard
 
 Restart pi. `/proxyguard check|restart|status` verifies it's live; logs go to `~/.pi/agent/proxy-guard.log`.
 
-## Setup: the Shortcuts shortcut
+## Setup: repairing Shadowrocket on macOS
 
-Default name: **Reconnect Shadowrocket** (set `PI_PROXY_GUARD_SHORTCUT` to rename). Build it in macOS Shortcuts — the user already has `Disconnect VPN` / `Connect VPN` shortcuts whose actions can be reused:
+Zero-setup (verified on the Apple-Silicon iOS-app runtime): the extension runs
 
-1. `Disconnect VPN` (or Shadowrocket "Stop" action)
-2. Wait 2s
-3. `Connect VPN` (or Shadowrocket "Start" action)
-4. Wait 5s
+```sh
+open -g "shadowrocket://disconnect?autoclose=true"   # tunnel drops
+sleep 3
+open -g "shadowrocket://connect?autoclose=true"     # fresh tunnel
+```
 
-Or, zero-setup: it falls back to `open shadowrocket://stop` → `shadowrocket://start` automatically (works when Shadowrocket registers its URL scheme — on macOS this needs the Apple Silicon iOS app).
+`-g` keeps Shadowrocket in the background; `autoclose=true` lets it quit itself. If you have **always-on** enabled, the tunnel may auto-reconnect before the explicit connect — either way you end up on a fresh tunnel, which is the point (the dead stream is already dead; repair makes the *next* request land on a rebuilt chain).
 
-Node switching is intentionally left to the proxy client (chain-proxy friendly). To make the *repair* more effective, build the node switch into the shortcut itself — e.g. select a different entry node inside Shadowrocket before reconnecting.
+### Shortcut path (optional)
+
+`PI_PROXY_GUARD_SHORTCUT` (default name **Reconnect Shadowrocket**) runs `shortcuts run <name>` first, scheme fallback after. **Verified caveat**: on macOS, `shortcuts run` does *not* fire iOS-app SiriKit intents — a shortcut wrapping Shadowrocket's `StopVPNIntent`/`StartVPNIntent` is a silent no-op via CLI (it only fires from the Shortcuts.app GUI). So on macOS the shortcut path only helps if it wraps shell-able actions (e.g. `Run Shell Script` driving another client). Set `PI_PROXY_GUARD_SHORTCUT=""` to skip it entirely.
+
+Node switching is intentionally left to the proxy client (chain-proxy friendly). To make the *repair* more effective, you can chain actions into the URL scheme too — e.g. `shadowrocket://select?s=<node>` before `connect` selects a different entry node.
+
+### Verification note
+
+`scutil --nc show/list` reports the NE manager's *intent* state and lags reality by several seconds — during a real disconnect it still says `Connected`. The extension therefore verifies repair with real HTTP probes through the proxy, never scutil.
 
 ## Tuning pi's own retries
 

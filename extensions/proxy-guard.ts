@@ -43,9 +43,21 @@
  *   PI_PROXY_GUARD_PROBE_GAP_MS          1500 (gap between probe attempts)
  *   PI_PROXY_GUARD_SHORTCUT              "Reconnect Shadowrocket" ("" disables)
  *   PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS   120000
+ *                                          NOTE: `shortcuts run` on macOS does NOT
+ *                                          fire iOS-app SiriKit intents (verified):
+ *                                          a shortcut wrapping Shadowrocket's
+ *                                          StopVPNIntent is a no-op via CLI, works
+ *                                          only from Shortcuts.app GUI. Only useful
+ *                                          for shortcuts with shell-able actions.
  *   PI_PROXY_GUARD_SCHEME                "1" (shadowrocket:// fallback)
- *   PI_PROXY_GUARD_SCHEME_STOP           shadowrocket://stop
- *   PI_PROXY_GUARD_SCHEME_START          shadowrocket://start
+ *   PI_PROXY_GUARD_SCHEME_STOP           shadowrocket://disconnect?autoclose=true
+ *   PI_PROXY_GUARD_SCHEME_START          shadowrocket://connect?autoclose=true
+ *                                          Verified working on macOS (iOS-app
+ *                                          runtime): `open -g` delivers the URL
+ *                                          without foregrounding; tunnel drops and
+ *                                          comes back. If Shadowrocket "always-on"
+ *                                          is enabled it may auto-reconnect before
+ *                                          our explicit connect — harmless either way.
  *   PI_PROXY_GUARD_ESCALATE_AFTER        2   (consecutive errors w/ OK check)
  *   PI_PROXY_GUARD_PAUSED_REPAIRS        3   (active repair cap while paused)
  *   PI_PROXY_GUARD_REPAIR_COOLDOWN_MS    90000
@@ -86,8 +98,10 @@ const PROBE_GAP_MS = Number(process.env.PI_PROXY_GUARD_PROBE_GAP_MS ?? 1_500);
 const SHORTCUT = process.env.PI_PROXY_GUARD_SHORTCUT ?? "Reconnect Shadowrocket";
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
-const SCHEME_STOP = process.env.PI_PROXY_GUARD_SCHEME_STOP ?? "shadowrocket://stop";
-const SCHEME_START = process.env.PI_PROXY_GUARD_SCHEME_START ?? "shadowrocket://start";
+// Verified against Shadowrocket's docs: connect/disconnect (not start/stop).
+// autoclose=true lets the app quit itself after handling the action.
+const SCHEME_STOP = process.env.PI_PROXY_GUARD_SCHEME_STOP ?? "shadowrocket://disconnect?autoclose=true";
+const SCHEME_START = process.env.PI_PROXY_GUARD_SCHEME_START ?? "shadowrocket://connect?autoclose=true";
 const ESCALATE_AFTER = Number(process.env.PI_PROXY_GUARD_ESCALATE_AFTER ?? 2);
 const PAUSED_REPAIR_MAX = Number(process.env.PI_PROXY_GUARD_PAUSED_REPAIRS ?? 3);
 const REPAIR_COOLDOWN_MS = Number(process.env.PI_PROXY_GUARD_REPAIR_COOLDOWN_MS ?? 90_000);
