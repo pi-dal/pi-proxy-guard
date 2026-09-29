@@ -13,13 +13,14 @@ type Harness = {
   socketCommands: string[];
   callLog: string;
   shadowLog: string;
+  sakamotoLog: string;
   logPath: string;
   ctx: any;
   shutdown: () => Promise<void>;
 };
 
 let sequence=0;
-async function makeHarness(status: "connected" | "disconnected", mode: "observe" | "recover", failFirst: number, failFrom = 0, waitMs = 0): Promise<Harness> {
+async function makeHarness(status: "connected" | "disconnected", mode: "observe" | "recover", failFirst: number, failFrom = 0, waitMs = 0, triggerReply = "queued"): Promise<Harness> {
   const dir=mkdtempSync(join(tmpdir(),"pi-guard-integration-"));
   const socketCommands:string[]=[];
   const server:Server=createServer((conn)=>conn.once("data",(data)=>{
@@ -29,6 +30,7 @@ async function makeHarness(status: "connected" | "disconnected", mode: "observe"
   await new Promise<void>((resolve,reject)=>server.listen(join(dir,"svc.sock"),resolve).once("error",reject));
   const callLog=join(dir,"curl-calls");
   const shadowLog=join(dir,"shadowrocket-calls");
+  const sakamotoLog=join(dir,"sakamoto-calls");
   const logPath=join(dir,"proxy-guard.log");
   writeFileSync(logPath,"prior log\n",{mode:0o644});
   const curl=join(dir,"curl");
@@ -39,6 +41,9 @@ if [ "$count" -le "$FAKE_FAIL_FIRST" ] || { [ "$FAKE_FAIL_FROM" -gt 0 ] && [ "$c
 case " $* " in *"__down"*) printf '200 65536';; *) printf '204';; esac
 `);
   chmodSync(curl,0o755);
+  const sakamoto=join(dir,"sakamoto");
+  writeFileSync(sakamoto,`#!/bin/sh\nprintf '%s\\n' "$*" >> "$FAKE_SAKAMOTO_LOG"\nprintf '%s\\n' "$FAKE_SAKAMOTO_RESPONSE"\n`);
+  chmodSync(sakamoto,0o755);
   for (const program of ["shortcuts","open"]) {
     const path=join(dir,program);
     writeFileSync(path,`#!/bin/sh\nprintf '%s\\n' ${program} >> "$FAKE_SHADOW_LOG"\nexit 1\n`);
@@ -62,6 +67,8 @@ case " $* " in *"__down"*) printf '200 65536';; *) printf '204';; esac
     PI_PROXY_GUARD_LOG:logPath,
     FAKE_CALL_LOG:callLog,
     FAKE_SHADOW_LOG:shadowLog,
+    FAKE_SAKAMOTO_LOG:sakamotoLog,
+    FAKE_SAKAMOTO_RESPONSE:triggerReply,
     FAKE_FAIL_FIRST:String(failFirst),
     FAKE_FAIL_FROM:String(failFrom),
   });
@@ -79,7 +86,7 @@ case " $* " in *"__down"*) printf '200 65536';; *) printf '204';; esac
     extension.default(pi);
     const ctx={hasUI:true,ui:{notify:(text:string)=>notices.push(text)},model:{baseUrl:"https://api.test.invalid/v1"},isIdle:()=>true};
     await handlers.get("session_start")?.({},ctx);
-    return {handlers,commands,notices,messages,socketCommands,callLog,shadowLog,logPath,ctx,shutdown:async()=>{
+    return {handlers,commands,notices,messages,socketCommands,callLog,shadowLog,sakamotoLog,logPath,ctx,shutdown:async()=>{
       await handlers.get("session_shutdown")?.();
       await new Promise<void>((resolve)=>server.close(()=>resolve()));
       rmSync(dir,{recursive:true,force:true});
@@ -120,6 +127,7 @@ test("quota errors never probe or invoke Shadowrocket",async()=>{
     assert.equal(result,undefined);
     assert.equal(lines(h.callLog),0);
     assert.equal(lines(h.shadowLog),0);
+    assert.equal(lines(h.sakamotoLog),0);
     assert.ok(h.notices.some((x)=>x.includes("Provider/account error")));
   } finally {await h.shutdown();}
 });
@@ -132,6 +140,7 @@ test("disconnected sakamoto is never started by the extension",async()=>{
     assert.equal(lines(h.callLog),0);
     assert.deepEqual(h.socketCommands,["status\n"]);
     assert.equal(lines(h.shadowLog),0);
+    assert.equal(lines(h.sakamotoLog),0);
   } finally {await h.shutdown();}
 });
 
@@ -142,7 +151,19 @@ test("observe mode stays paused on confirmed proxy failure",async()=>{
     assert.equal(result,undefined);
     assert.equal(lines(h.callLog),2);
     assert.equal(lines(h.shadowLog),0);
+    assert.equal(lines(h.sakamotoLog),0);
     assert.ok(h.notices.some((x)=>x.includes("Observe-only mode")));
+  } finally {await h.shutdown();}
+});
+
+test("a manual selection is never overwritten by a trigger",async()=>{
+  const h=await makeHarness("connected","recover",10,0,0,"manual");
+  try {
+    const result=await h.handlers.get("agent_before_settle")?.(boundary("ECONNRESET"),h.ctx);
+    assert.equal(result,undefined);
+    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
+    assert.equal(lines(h.shadowLog),0);
+    assert.ok(h.notices.some((x)=>x.includes("manual")));
   } finally {await h.shutdown();}
 });
 
@@ -164,6 +185,7 @@ test("a broken chained path stays paused rather than cycling nodes",async()=>{
     assert.equal(result,undefined);
     assert.equal(h.messages.length,0);
     assert.equal(lines(h.shadowLog),0);
+    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
     assert.ok(h.socketCommands.length>0 && h.socketCommands.every((command)=>command==="status\n"));
     assert.ok(h.notices.some((x)=>x.includes("still down")));
   } finally {await h.shutdown();}
@@ -189,6 +211,7 @@ test("recover waits for watcher, verifies deep path and then continues",async()=
     assert.equal(result?.entries?.[0]?.type,"custom_message");
     assert.ok(lines(h.callLog)>=4);
     assert.equal(lines(h.shadowLog),0);
+    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
     assert.ok(h.socketCommands.every((command)=>command==="status\n"));
     assert.equal(h.messages.length,0);
   } finally {await h.shutdown();}

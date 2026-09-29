@@ -11,7 +11,8 @@
  * With sakamoto, this extension never selects a node, starts/stops a VPN, or
  * reads the native API secret. The existing sakamoto watcher exclusively owns
  * RealityAuto/OthersAuto fallback and preserves ManualPick. Observe mode
- * (default) stays paused and watches; recover mode waits one watcher interval
+ * (default) stays paused and watches; recover mode issues one `sakamoto
+ * recover` request for fresh watcher-owned tests, then waits one interval
  * before deep verification. A broken chained SOCKS exit cannot be repaired by
  * selecting a different entry and must be reported rather than bounced.
  *
@@ -45,6 +46,7 @@ const PROBE_GAP_MS = Number(process.env.PI_PROXY_GUARD_PROBE_GAP_MS ?? 1_500);
 const BACKEND_REQUEST = process.env.PI_PROXY_GUARD_BACKEND;
 const SAKAMOTO_MODE = process.env.PI_PROXY_GUARD_SAKAMOTO_MODE === "recover" ? "recover" : "observe";
 const SAKAMOTO_WAIT_MS = Number(process.env.PI_PROXY_GUARD_SAKAMOTO_WAIT_MS ?? 45_000);
+const SAKAMOTO_BIN = process.env.PI_PROXY_GUARD_SAKAMOTO_BIN ?? "sakamoto";
 const SHORTCUT = process.env.PI_PROXY_GUARD_SHORTCUT ?? "Reconnect Shadowrocket";
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
@@ -332,7 +334,15 @@ export default function (pi: ExtensionAPI) {
 		failedRepairs++;
 		try {
 			if (backend === "sakamoto") {
-				notify(ctx, "Waiting for sakamoto's existing automatic fallback; no selector or VPN restart requested…", "warning");
+				const request=await execCmd(SAKAMOTO_BIN,["recover"],5_000);
+				if (token!==sessionToken) return false;
+				if (!request.ok) {notify(ctx,`sakamoto recovery trigger unavailable: ${request.error}`,"warning");return false;}
+				const status=(request.output??"").trim();
+				if (!["queued","busy","cooldown"].includes(status)) {
+					notify(ctx,`sakamoto did not queue a switch (${status || "unknown"}); ManualPick and disabled fallback are never overridden.`,"warning");
+					return false;
+				}
+				notify(ctx,`sakamoto recovery ${status}; waiting for watcher-owned URL tests (no VPN restart)…`,"warning");
 				await sleep(Math.max(0, SAKAMOTO_WAIT_MS));
 				if (token!==sessionToken) return false;
 				const check = await verifyRecovery(ctx);

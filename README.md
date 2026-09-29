@@ -9,17 +9,17 @@ A [Pi](https://github.com/earendil-works/pi) extension that recovers **network-f
 | Quota, authentication, permission, or unknown error | Stay paused. Never change the proxy or automatically repeat a provider request. |
 | Classified network/stream error; deep Pi path works twice | Continue once after a short backoff. |
 | Repeated deep Pi-path failure; sakamoto **observe** mode (default) | Stay paused while sakamoto's independent watcher works. Deep-check again later; never restart or select a node. |
-| Repeated deep failure; sakamoto **recover** mode | Wait for sakamoto's next watcher interval (default 45s), then require two fresh deep successes before continuing. If still down, stay paused and notify. |
+| Repeated deep failure; sakamoto **recover** mode | Call `sakamoto recover` once, wait for watcher-owned URL tests (default 45s), then require two fresh deep successes before continuing. If still down, stay paused and notify. |
 | Sakamoto supervisor deliberately disconnected | Do not start the VPN. Stay paused until the user connects it. |
 
 A deep check queries the active model API host for transport reachability and downloads at least 60 KB from an independent endpoint. A cheap 204 probe alone cannot resume a paused session. Three consecutive failed attempts (default) avoid switching because of one latency spike. A verified recovery must pass **two** sustained-transfer checks. Provider-request budgets, repair cooldowns and passive monitoring remain in force.
 
-**Selector ownership:** sakamoto already URL-tests `RealityAuto` and `OthersAuto` and may switch `MainProxy` when its own evidence says one group failed. `ManualPick` remains manual. This extension never writes the selector, reads the sing-box API key, bypasses a chained SOCKS exit, or restarts the TUN. A SOCKS-exit failure may leave both entry groups healthy; node switching cannot reliably solve that case and the session remains paused for diagnosis.
+**Selector ownership:** sakamoto already URL-tests `RealityAuto` and `OthersAuto` and may switch `MainProxy` when its own evidence says one group failed. `ManualPick` remains manual. The Pi extension can request fresh tests via `sakamoto recover`, but never writes the selector, reads the sing-box API key, bypasses a chained SOCKS exit, or restarts the TUN. A SOCKS-exit failure may leave both entry groups healthy; node switching cannot reliably solve that case and the session remains paused for diagnosis.
 
 ## Install and start safely
 
 ```bash
-pi install git:github.com/pi-dal/pi-proxy-guard@v0.7.0
+pi install git:github.com/pi-dal/pi-proxy-guard@v0.7.1
 # Or load a checkout locally for testing:
 pi install ~/Developer/pi-proxy-guard
 ```
@@ -35,7 +35,7 @@ export PI_PROXY_GUARD_SAKAMOTO_MODE=recover
 
 If Pi explicitly uses sakamoto's local mixed proxy, its health checks should use **that same proxy path**. `curl` otherwise inherits the process HTTP(S) proxy environment, which may not match Pi's transport in every setup. Set `PI_PROXY_GUARD_PROXY` only after checking Pi's own proxy setting and your actual mixed-inbound port. `curl --noproxy '*'` bypasses an HTTP proxy, **not** a macOS TUN; it is not a proof of direct internet access.
 
-The guard trusts sakamoto's watcher to switch only on fresh URL tests. Its tests check entry nodes, not necessarily the chained SOCKS exit. In recover mode it waits, verifies the **Pi path**, and leaves a failed session paused rather than cycling nodes or retrying the provider indefinitely. A mid-stream cut cannot be undone; a healthy route lets Pi's next request succeed.
+The guard sends a single `sakamoto recover` request after confirmed failure. A user-only `watch.sock` responds `queued`, `busy`, `cooldown`, `manual`, `disabled`, or `unavailable`. Only `queued`/`busy`/`cooldown` lead to a bounded wait and deep recheck; manual/disabled/unavailable never cause a direct switch. Sakamoto's watcher tests entry nodes and controls `MainProxy`, but does not necessarily test the chained SOCKS exit. The plugin verifies the **Pi path**, and leaves a failed session paused rather than cycling nodes or retrying the provider indefinitely. The request needs a sakamoto watcher version with this interface (v0.2.1 or newer); an older watcher fails safely with no Shadowrocket fallback. A mid-stream cut cannot be undone; a healthy route lets Pi's next request succeed.
 
 ## Legacy Shadowrocket backend (explicit opt-in)
 
@@ -54,7 +54,8 @@ The guard trusts sakamoto's watcher to switch only on fresh URL tests. Its tests
 | `PI_PROXY_GUARD` | `1` | `0` disables the extension. |
 | `PI_PROXY_GUARD_BACKEND` | `auto` | `auto` finds sakamoto's local supervisor; `sakamoto` requires it; `shadowrocket` explicitly enables legacy repair; `none` never repairs. |
 | `PI_PROXY_GUARD_SAKAMOTO_MODE` | `observe` | `recover` waits for watcher-owned fallback, without selector or VPN writes. |
-| `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for sakamoto's URL-test and settle cycle. |
+| `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for triggered URL tests and settle cycle. |
+| `PI_PROXY_GUARD_SAKAMOTO_BIN` | `sakamoto` | CLI executable invoked with `recover`; no API secret is passed. |
 | `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | Cheap watchdog probe; requires HTTP 2xx. |
 | `PI_PROXY_GUARD_API_URL` | current model base URL | API host for a deep transport check; 5xx is not a successful path. |
 | `PI_PROXY_GUARD_STREAM_URL` | Cloudflare 64 KB download | Sustained-transfer target; must return 2xx and enough bytes. |
