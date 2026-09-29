@@ -1,105 +1,77 @@
 # pi-proxy-guard
 
-Auto-recover [pi](https://github.com/earendil-works/pi) sessions when the proxy drops mid-run.
+A [Pi](https://github.com/earendil-works/pi) extension that recovers **network-failed** sessions without treating every provider error as a broken proxy. It does not own sakamoto's VPN or node selector.
 
-When all provider retries fail (`Retry failed after N attempts` / `Stream ended without finish_reason`), pi pauses the session. This extension:
+## What happens on an error
 
-1. **Checks connectivity**, two tiers: the watchdog uses a cheap ping (`generate_204` through the same `https_proxy` env pi uses); at settle/recheck time it does a **deep probe** — API host reachability (`ctx.model.baseUrl`, any HTTP response counts) **plus a sustained-transfer check** (`STREAM_MIN_BYTES` from `STREAM_URL`) — the signal a 0-byte ping can't see: whether the chain can actually hold a streaming connection. 'Down' requires `PROBE_ATTEMPTS` consecutive failures.
-2. **Auto-continues** the run if the proxy is fine (transient stream cut).
-3. **Repairs the proxy** if it's down — runs a macOS Shortcuts shortcut, falls back to `shadowrocket://` URL schemes — then continues once connectivity is verified.
-4. **Watchdog**: if pi is still paused, it keeps watching; once the proxy is verified healthy again it sends `continue` itself. It also repairs the proxy while pi is mid-retry, so many incidents never reach the pause at all.
-   - **If the proxy stays down**: at most `PAUSED_REPAIRS` (default 3) active repair attempts per down-episode; afterwards it switches to a cheap passive watch (one curl per `WATCHDOG_MS`) and **still auto-resumes** the moment the proxy verifies OK — e.g. after you fix it manually. It never gives up on resuming, it just stops hammering Shortcuts.
-6. **Notifications**: on *repeated* failure (active repairs exhausted, or continue-budget exhausted) it pushes a notification — to your iPhone via Bark, a generic webhook, and/or macOS Notification Center. Push traffic bypasses the proxy (`--noproxy '*'`) so it reaches you even while the proxy is dead. Push bodies start with `💻 <hostname>` + `📁 <cwd>` so pushes from pi-sync'd machines are attributable.
+| Evidence | Action |
+|---|---|
+| Quota, authentication, permission, or unknown error | Stay paused. Never change the proxy or automatically repeat a provider request. |
+| Classified network/stream error; deep Pi path works twice | Continue once after a short backoff. |
+| Repeated deep Pi-path failure; sakamoto **observe** mode (default) | Stay paused while sakamoto's independent watcher works. Deep-check again later; never restart or select a node. |
+| Repeated deep failure; sakamoto **recover** mode | Wait for sakamoto's next watcher interval (default 45s), then require two fresh deep successes before continuing. If still down, stay paused and notify. |
+| Sakamoto supervisor deliberately disconnected | Do not start the VPN. Stay paused until the user connects it. |
 
-## Notifications (iPhone)
+A deep check queries the active model API host for transport reachability and downloads at least 60 KB from an independent endpoint. A cheap 204 probe alone cannot resume a paused session. Three consecutive failed attempts (default) avoid switching because of one latency spike. A verified recovery must pass **two** sustained-transfer checks. Provider-request budgets, repair cooldowns and passive monitoring remain in force.
 
-1. Install [Bark](https://bark.day.app) on your iPhone, copy the push URL it shows (like `https://api.day.app/AbCdEfGhIjKlMnOpQr/`).
-2. Export once (shell rc) or per-launch:
-   ```bash
-   export PI_PROXY_GUARD_BARK="https://api.day.app/<your-device-key>"
-   ```
-   Push uses Bark's POST form (`title`/`body`/`group`/`level=timeSensitive`), requests are `curl --noproxy '*' -m 10`.
-3. Optional generic webhook (Pushcut / 企业微信 / n8n — POSTs `{"title","body"}`):
-   ```bash
-   export PI_PROXY_GUARD_WEBHOOK="https://your.webhook/endpoint"
-   ```
+**Selector ownership:** sakamoto already URL-tests `RealityAuto` and `OthersAuto` and may switch `MainProxy` when its own evidence says one group failed. `ManualPick` remains manual. This extension never writes the selector, reads the sing-box API key, bypasses a chained SOCKS exit, or restarts the TUN. A SOCKS-exit failure may leave both entry groups healthy; node switching cannot reliably solve that case and the session remains paused for diagnosis.
 
-Channels: `PI_PROXY_GUARD_NOTIFY="macos,bark,webhook"` (default; unconfigured channels are skipped), `"0"` silences all. Pushes are throttled to one per `NOTIFY_COOLDOWN_MS` (10min) — while things stay broken it acts as a periodic reminder.
-5. **Half-dead node detection**: if the health check passes but streams keep cutting (≥ `ESCALATE_AFTER` consecutive error settles), it repairs anyway — a flapping node is usually not the same as a dead one.
-6. **Anti-loop budget**: at most `MAX_REPAIRS` auto-continues per `WINDOW_MS` (rolling). Exhausted → stays paused; any clean run resets the budget.
-
-## Install
+## Install and start safely
 
 ```bash
-pi install git:github.com/pi-dal/pi-proxy-guard
-# or from a local checkout:
+pi install git:github.com/pi-dal/pi-proxy-guard@v0.7.0
+# Or load a checkout locally for testing:
 pi install ~/Developer/pi-proxy-guard
 ```
 
-Restart pi. `/proxyguard check|restart|status` verifies it's live; logs go to `~/.pi/agent/proxy-guard.log`.
+Restart or reload Pi **while idle**. `/proxyguard check`, `/proxyguard status`, and `/proxyguard recover` inspect the guard. It does not migrate an existing sakamoto daemon or turn on the VPN. The default `PI_PROXY_GUARD_BACKEND=auto` uses sakamoto only if its private local supervisor socket is present; otherwise it does not launch any VPN. It never falls back to Shadowrocket implicitly.
 
-## Setup: repairing Shadowrocket on macOS
+Begin with observe-only behavior (the default) and inspect `~/.pi/agent/proxy-guard.log`. Once the Pi provider path and sakamoto's watcher have been verified together, opt into waiting for automatic watcher recovery:
 
-Zero-setup (verified on the Apple-Silicon iOS-app runtime): the extension runs
-
-```sh
-open -g "shadowrocket://disconnect?autoclose=true"   # tunnel drops
-sleep 3
-open -g "shadowrocket://connect?autoclose=true"     # fresh tunnel
+```bash
+export PI_PROXY_GUARD_BACKEND=sakamoto
+export PI_PROXY_GUARD_SAKAMOTO_MODE=recover
 ```
 
-`-g` keeps Shadowrocket in the background; `autoclose=true` lets it quit itself. If you have **always-on** enabled, the tunnel may auto-reconnect before the explicit connect — either way you end up on a fresh tunnel, which is the point (the dead stream is already dead; repair makes the *next* request land on a rebuilt chain).
+If Pi explicitly uses sakamoto's local mixed proxy, its health checks should use **that same proxy path**. `curl` otherwise inherits the process HTTP(S) proxy environment, which may not match Pi's transport in every setup. Set `PI_PROXY_GUARD_PROXY` only after checking Pi's own proxy setting and your actual mixed-inbound port. `curl --noproxy '*'` bypasses an HTTP proxy, **not** a macOS TUN; it is not a proof of direct internet access.
 
-### Shortcut path (optional)
+The guard trusts sakamoto's watcher to switch only on fresh URL tests. Its tests check entry nodes, not necessarily the chained SOCKS exit. In recover mode it waits, verifies the **Pi path**, and leaves a failed session paused rather than cycling nodes or retrying the provider indefinitely. A mid-stream cut cannot be undone; a healthy route lets Pi's next request succeed.
 
-`PI_PROXY_GUARD_SHORTCUT` (default name **Reconnect Shadowrocket**) runs `shortcuts run <name>` first, scheme fallback after. **Verified caveat**: on macOS, `shortcuts run` does *not* fire iOS-app SiriKit intents — a shortcut wrapping Shadowrocket's `StopVPNIntent`/`StartVPNIntent` is a silent no-op via CLI (it only fires from the Shortcuts.app GUI). So on macOS the shortcut path only helps if it wraps shell-able actions (e.g. `Run Shell Script` driving another client). Set `PI_PROXY_GUARD_SHORTCUT=""` to skip it entirely.
+## Legacy Shadowrocket backend (explicit opt-in)
 
-Node switching is intentionally left to the proxy client (chain-proxy friendly). To make the *repair* more effective, you can chain actions into the URL scheme too — e.g. `shadowrocket://select?s=<node>` before `connect` selects a different entry node.
+`PI_PROXY_GUARD_BACKEND=shadowrocket` retains the old shortcut-first and `shadowrocket://` fallback. **Do not enable it while sakamoto TUN is active:** two VPNs can conflict and sakamoto's supervisor will stop its TUN. `PI_PROXY_GUARD_SHORTCUT=""` disables Shortcuts; `PI_PROXY_GUARD_SCHEME=0` disables URL-scheme repair. The macOS CLI cannot invoke iOS-app SiriKit VPN intents through `shortcuts run`; only shell-capable Shortcuts are useful.
 
-### Verification note
+## Notifications
 
-`scutil --nc show/list` reports the NE manager's *intent* state and lags reality by several seconds — during a real disconnect it still says `Connected`. The extension therefore verifies repair with real HTTP probes through the proxy, never scutil.
+`PI_PROXY_GUARD_NOTIFY="macos,bark,webhook"` enables configured channels (default); `0` disables all. Bark and webhook URLs are secrets—never add them to git or logs. The guard creates its own diagnostic log with mode `0600` and redacts credentials from status and command errors. A Bark URL can be supplied as `PI_PROXY_GUARD_BARK`; a JSON webhook uses `PI_PROXY_GUARD_WEBHOOK`. Notifications are throttled by `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS`. Curl's `--noproxy '*'` bypasses the HTTP proxy for notifications but **does not bypass TUN routing**, so delivery during a full network outage is not guaranteed.
 
-## Tuning pi's own retries
+`PI_PROXY_GUARD_NOTIFY_FINISH_MS=120000` enables a duration-gated "Pi finished" message only when the Pi run actually completed and went idle; failed settles are not sent as successful completions. `PI_PROXY_GUARD_NOTIFY_RESUME=1` also announces recovery.
 
-`~/.pi/agent/settings.json` — more internal retries give the watchdog runway to repair mid-run, so fewer pauses ever happen:
+## Configuration
 
-```json
-"retry": { "enabled": true, "maxRetries": 5, "baseDelayMs": 4000, "maxAgentDelayMs": 60000 }
-```
-
-## Env knobs
-
-| Var | Default | Meaning |
+| Variable | Default | Meaning |
 |---|---|---|
-| `PI_PROXY_GUARD` | `1` | `0` disables |
-| `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | cheap ping (watchdog ticks) |
-| `PI_PROXY_GUARD_API_URL` | `ctx.model.baseUrl` | deep-probe target; defaults to the active model's API host — any HTTP response counts as reachable |
-| `PI_PROXY_GUARD_STREAM_URL` | `https://speed.cloudflare.com/__down?bytes=65536` | sustained-transfer probe used in deep checks |
-| `PI_PROXY_GUARD_STREAM_MIN_BYTES` | `60000` | min bytes the transfer must deliver; `0` disables it |
-| `PI_PROXY_GUARD_VPN_SERVICE` | _unset_ | `scutil --nc` service name — tunnel-down short-circuits straight to repair |
-| `PI_PROXY_GUARD_PROXY` | _(env)_ | explicit `-x` proxy for the check |
-| `PI_PROXY_GUARD_TIMEOUT_MS` | `20000` | per-attempt check timeout |
-| `PI_PROXY_GUARD_PROBE_ATTEMPTS` | `2` | consecutive failures required to declare "down" — tolerates latency spikes without mis-firing a repair |
-| `PI_PROXY_GUARD_PROBE_GAP_MS` | `1500` | gap between probe attempts |
-| `PI_PROXY_GUARD_SHORTCUT` | `Reconnect Shadowrocket` | `""` disables |
-| `PI_PROXY_GUARD_SCHEME` | `1` | `0` disables `shadowrocket://` fallback |
-| `PI_PROXY_GUARD_ESCALATE_AFTER` | `2` | consecutive errors → repair despite OK ping |
-| `PI_PROXY_GUARD_PAUSED_REPAIRS` | `3` | active repair attempts per down-episode before passive watch |
-| `PI_PROXY_GUARD_NOTIFY` | `macos,bark,webhook` | channels; `0`/`off` disables |
-| `PI_PROXY_GUARD_NOTIFY_RESUME` | `0` | `1` also pushes when the session resumes |
-| `PI_PROXY_GUARD_NOTIFY_FINISH_MS` | `0` | `>0` pushes "Pi finished" only for clean completes lasting ≥ this long — unlike pi-bark, never fires on error settles; e.g. `120000` |
-| `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS` | `600000` | min gap between pushes |
-| `PI_PROXY_GUARD_BARK` | _unset_ | Bark URL incl. device key |
-| `PI_PROXY_GUARD_WEBHOOK` | _unset_ | generic JSON webhook |
-| `PI_PROXY_GUARD_REPAIR_COOLDOWN_MS` | `90000` | min gap between repairs |
-| `PI_PROXY_GUARD_RECHECK_DELAY_MS` | `8000` | wait after repair before recheck |
-| `PI_PROXY_GUARD_BACKOFF_MS` | `3000` | wait before continue on OK check |
-| `PI_PROXY_GUARD_MAX_REPAIRS` | `5` | auto-continues per window |
-| `PI_PROXY_GUARD_WINDOW_MS` | `600000` | budget window |
-| `PI_PROXY_GUARD_WATCHDOG_MS` | `60000` | `0` disables |
-| `PI_PROXY_GUARD_LOG` | `~/.pi/agent/proxy-guard.log` | `""` disables |
+| `PI_PROXY_GUARD` | `1` | `0` disables the extension. |
+| `PI_PROXY_GUARD_BACKEND` | `auto` | `auto` finds sakamoto's local supervisor; `sakamoto` requires it; `shadowrocket` explicitly enables legacy repair; `none` never repairs. |
+| `PI_PROXY_GUARD_SAKAMOTO_MODE` | `observe` | `recover` waits for watcher-owned fallback, without selector or VPN writes. |
+| `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for sakamoto's URL-test and settle cycle. |
+| `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | Cheap watchdog probe; requires HTTP 2xx. |
+| `PI_PROXY_GUARD_API_URL` | current model base URL | API host for a deep transport check; 5xx is not a successful path. |
+| `PI_PROXY_GUARD_STREAM_URL` | Cloudflare 64 KB download | Sustained-transfer target; must return 2xx and enough bytes. |
+| `PI_PROXY_GUARD_STREAM_MIN_BYTES` | `60000` | Minimum successful bytes; `0` disables transfer verification (less safe). |
+| `PI_PROXY_GUARD_PROXY` | process proxy environment | Optional explicit curl proxy; use Pi's actual path. |
+| `PI_PROXY_GUARD_TIMEOUT_MS` | `20000` | Timeout for one probe attempt. |
+| `PI_PROXY_GUARD_PROBE_ATTEMPTS` | `3` | Consecutive failures required to conclude that a path is down. |
+| `PI_PROXY_GUARD_PROBE_GAP_MS` | `1500` | Delay between attempts and independent recovery checks. |
+| `PI_PROXY_GUARD_PAUSED_REPAIRS` | `3` | Maximum active waits/repairs in one outage episode. |
+| `PI_PROXY_GUARD_REPAIR_COOLDOWN_MS` | `90000` | Minimum gap between recovery attempts. |
+| `PI_PROXY_GUARD_WATCHDOG_MS` | `60000` | Watch an active or paused run; `0` disables it. |
+| `PI_PROXY_GUARD_MAX_REPAIRS` / `PI_PROXY_GUARD_WINDOW_MS` | `5` / `600000` | Rolling provider auto-continue budget. |
+| `PI_PROXY_GUARD_BACKOFF_MS` / `PI_PROXY_GUARD_RECHECK_DELAY_MS` | `3000` / `8000` | Delays for continuation/explicit legacy repair. |
+| `PI_PROXY_GUARD_VPN_SERVICE` | unset | Optional `scutil --nc` service used **only** for the explicit Shadowrocket backend. |
+| `PI_PROXY_GUARD_SHORTCUT` / `PI_PROXY_GUARD_SCHEME` | `Reconnect Shadowrocket` / `1` | **Legacy backend only**. Neither runs under sakamoto/none. |
+| `PI_PROXY_GUARD_NOTIFY` / `PI_PROXY_GUARD_NOTIFY_RESUME` | `macos,bark,webhook` / `0` | Notification channels and optional resume push. |
+| `PI_PROXY_GUARD_NOTIFY_FINISH_MS` / `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS` | `0` / `600000` | Completion threshold and push throttle. |
+| `PI_PROXY_GUARD_LOG` | `~/.pi/agent/proxy-guard.log` | Empty string disables the diagnostic log. |
 
-## Structural fix (if nodes keep flapping)
-
-A mid-stream cut can't be undone — only prevented. If this keeps happening, put a local proxy with node failover between pi and the subscriptions: mihomo/clash `url-test` or `fallback` group → point `https_proxy` at `127.0.0.1:7890`. Pi's retries then hit a healthy node automatically and extension repairs become rare.
+For emergency rollback set `PI_PROXY_GUARD=0` and reload Pi when idle; this does not touch sakamoto or its running VPN. The extension neither exposes nor prints the sakamoto API secret.

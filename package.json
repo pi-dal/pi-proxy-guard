@@ -1,7 +1,11 @@
 {
 	"name": "pi-proxy-guard",
-	"version": "0.6.2",
-	"description": "Auto-recover pi sessions when the proxy drops: connectivity check, Shadowrocket restart/node-switch via Shortcuts or URL scheme, watchdog auto-resume.",
+	"version": "0.7.0",
+	"description": "Recover pi sessions via verified proxy health and sakamoto-owned fallback; Shadowrocket repair is explicit legacy opt-in.",
+	"scripts": {
+		"test": "node --test tests/*.test.ts",
+		"check": "node --check extensions/proxy-guard.ts && node --check extensions/recovery-policy.ts && node --check extensions/sakamoto-adapter.ts"
+	},
 	"license": "MIT",
 	"repository": {
 		"type": "git",

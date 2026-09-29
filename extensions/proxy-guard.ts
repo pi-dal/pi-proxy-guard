@@ -1,89 +1,36 @@
 /**
- * Proxy Guard — auto-recover Pi when the upstream proxy breaks.
+ * Proxy Guard — conservative Pi session recovery, with sakamoto as the default
+ * backend when its local supervisor socket exists. Shadowrocket repair requires
+ * the explicit PI_PROXY_GUARD_BACKEND=shadowrocket legacy setting.
  *
- * Trigger: `agent_before_settle` with outcome "error" = all provider retries
- * exhausted and Pi is about to pause. After "Retry failed after N attempts"
- * the errored assistant message is the last context message, so boundary
- * canContinue is FALSE and a bare {continue:true} is rejected; we append a
- * custom_message draft (projects to a `user` message for the LLM) with it.
+ * Only a classified network/stream error may trigger recovery. Three spaced
+ * attempts check the Pi API host and a sustained transfer on the same proxy
+ * path; two independent deep successes are required before continuing Pi.
+ * Quota/auth/unclassified errors stay paused without switching anything.
  *
- * Flow on settle-error:
- *  1. Wait for any in-flight watchdog repair to finish (they serialize).
- *  2. Budget: max MAX_REPAIRS auto-continues per WINDOW_MS (rolling); a clean
- *     settle resets it. Exhausted -> stay paused, take over manually.
- *  3. curl CHECK_URL (inherits env proxy vars = same network path as Pi).
- *  4. Repair decision:
- *       - check down                      -> repair, then continue iff OK
- *       - check OK but ESCALATE_AFTER consecutive error settles
- *         (half-dead node: ping fine, streams cut) -> repair anyway
- *       - check OK                        -> backoff -> continue
- *  5. Repair chain (first success wins, each followed by a recheck):
- *       a. macOS Shortcuts shortcut (default "Reconnect Shadowrocket")
- *       b. scheme bounce: shadowrocket://stop -> shadowrocket://start
- *     If still down -> pausedByUs; watchdog auto-resumes once verified OK.
- *     Active repairs are capped at PAUSED_REPAIR_MAX per down-episode;
- *     afterwards the watchdog keeps a cheap passive watch and still
- *     auto-resumes when the proxy comes back on its own.
+ * With sakamoto, this extension never selects a node, starts/stops a VPN, or
+ * reads the native API secret. The existing sakamoto watcher exclusively owns
+ * RealityAuto/OthersAuto fallback and preserves ManualPick. Observe mode
+ * (default) stays paused and watches; recover mode waits one watcher interval
+ * before deep verification. A broken chained SOCKS exit cannot be repaired by
+ * selecting a different entry and must be reported rather than bounced.
  *
- * Watchdog (WATCHDOG_MS): repairs the proxy while a run is mid-retry or while
- * paused-by-us (never while cleanly idle, so manually turning VPN off is
- * respected). On recovery + pausedByUs it sends sendUserMessage("continue").
- *
- * Env knobs (defaults):
- *   PI_PROXY_GUARD=0                     disable
- *   PI_PROXY_GUARD_URL                   https://www.google.com/generate_204
- *                                        (cheap ping used by the watchdog)
- *   PI_PROXY_GUARD_API_URL               (unset = use ctx.model.baseUrl)
- *   PI_PROXY_GUARD_STREAM_URL            https://speed.cloudflare.com/__down?bytes=65536
- *   PI_PROXY_GUARD_STREAM_MIN_BYTES      60000  (0 disables transfer probe)
- *   PI_PROXY_GUARD_VPN_SERVICE           ""    (scutil --nc fast-path name)
- *   PI_PROXY_GUARD_PROXY                 (unset = inherit env proxy vars)
- *   PI_PROXY_GUARD_TIMEOUT_MS            20000
- *   PI_PROXY_GUARD_PROBE_ATTEMPTS        2   (down requires N consecutive fails)
- *   PI_PROXY_GUARD_PROBE_GAP_MS          1500 (gap between probe attempts)
- *   PI_PROXY_GUARD_SHORTCUT              "Reconnect Shadowrocket" ("" disables)
- *   PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS   120000
- *                                          NOTE: `shortcuts run` on macOS does NOT
- *                                          fire iOS-app SiriKit intents (verified):
- *                                          a shortcut wrapping Shadowrocket's
- *                                          StopVPNIntent is a no-op via CLI, works
- *                                          only from Shortcuts.app GUI. Only useful
- *                                          for shortcuts with shell-able actions.
- *   PI_PROXY_GUARD_SCHEME                "1" (shadowrocket:// fallback)
- *   PI_PROXY_GUARD_SCHEME_STOP           shadowrocket://disconnect?autoclose=true
- *   PI_PROXY_GUARD_SCHEME_START          shadowrocket://connect?autoclose=true
- *                                          Verified working on macOS (iOS-app
- *                                          runtime): `open -g` delivers the URL
- *                                          without foregrounding; tunnel drops and
- *                                          comes back. If Shadowrocket "always-on"
- *                                          is enabled it may auto-reconnect before
- *                                          our explicit connect — harmless either way.
- *   PI_PROXY_GUARD_ESCALATE_AFTER        2   (consecutive errors w/ OK check)
- *   PI_PROXY_GUARD_PAUSED_REPAIRS        3   (active repair cap while paused)
- *   PI_PROXY_GUARD_REPAIR_COOLDOWN_MS    90000
- *   PI_PROXY_GUARD_RECHECK_DELAY_MS      8000
- *   PI_PROXY_GUARD_BACKOFF_MS            3000
- *   PI_PROXY_GUARD_MAX_REPAIRS           5
- *   PI_PROXY_GUARD_WINDOW_MS             600000
- *   PI_PROXY_GUARD_WATCHDOG_MS           60000  (0 disables)
- *   PI_PROXY_GUARD_NOTIFY                "macos,bark,webhook"
- *                                          (channels, "0"/off disables all)
- *   PI_PROXY_GUARD_NOTIFY_RESUME         "0"    (1 also notifies on recovery)
- *   PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS    600000
- *   PI_PROXY_GUARD_BARK                  ""    Bark push URL, e.g.
- *                                          https://api.day.app/<device_key>
- *   PI_PROXY_GUARD_WEBHOOK               ""    POSTs {title,body} JSON
- *   Push requests always go DIRECT (--noproxy '*'): the whole point is
- *   reaching you while the proxy is dead.
- *   PI_PROXY_GUARD_LOG                   ~/.pi/agent/proxy-guard.log ("" disables)
+ * Pi's agent_before_settle boundary cannot continue a failed assistant turn
+ * without a new message when context.canContinue is false. On VERIFIED
+ * recovery we append a hidden custom_message draft and request one continuation.
+ * The watchdog verifies the full deep path twice before resuming a pause.
+ * All loops have cooldown, per-incident repair caps and a rolling provider
+ * request budget. See README.md for configuration and limitations.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { chooseBackend, classifyProviderError, shouldAttemptRecovery, transferHealthy, transportReached, type Backend } from "./recovery-policy.ts";
+import { findSupervisorSocket, supervisorStatus } from "./sakamoto-adapter.ts";
 
 const DISABLED = process.env.PI_PROXY_GUARD === "0";
 const CHECK_URL = process.env.PI_PROXY_GUARD_URL ?? "https://www.google.com/generate_204";
@@ -93,8 +40,11 @@ const STREAM_MIN_BYTES = Number(process.env.PI_PROXY_GUARD_STREAM_MIN_BYTES ?? 6
 const VPN_SERVICE = process.env.PI_PROXY_GUARD_VPN_SERVICE ?? "";
 const CHECK_PROXY = process.env.PI_PROXY_GUARD_PROXY;
 const CHECK_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_TIMEOUT_MS ?? 20_000);
-const PROBE_ATTEMPTS = Number(process.env.PI_PROXY_GUARD_PROBE_ATTEMPTS ?? 2);
+const PROBE_ATTEMPTS = Number(process.env.PI_PROXY_GUARD_PROBE_ATTEMPTS ?? 3);
 const PROBE_GAP_MS = Number(process.env.PI_PROXY_GUARD_PROBE_GAP_MS ?? 1_500);
+const BACKEND_REQUEST = process.env.PI_PROXY_GUARD_BACKEND;
+const SAKAMOTO_MODE = process.env.PI_PROXY_GUARD_SAKAMOTO_MODE === "recover" ? "recover" : "observe";
+const SAKAMOTO_WAIT_MS = Number(process.env.PI_PROXY_GUARD_SAKAMOTO_WAIT_MS ?? 45_000);
 const SHORTCUT = process.env.PI_PROXY_GUARD_SHORTCUT ?? "Reconnect Shadowrocket";
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
@@ -102,7 +52,6 @@ const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
 // autoclose=true lets the app quit itself after handling the action.
 const SCHEME_STOP = process.env.PI_PROXY_GUARD_SCHEME_STOP ?? "shadowrocket://disconnect?autoclose=true";
 const SCHEME_START = process.env.PI_PROXY_GUARD_SCHEME_START ?? "shadowrocket://connect?autoclose=true";
-const ESCALATE_AFTER = Number(process.env.PI_PROXY_GUARD_ESCALATE_AFTER ?? 2);
 const PAUSED_REPAIR_MAX = Number(process.env.PI_PROXY_GUARD_PAUSED_REPAIRS ?? 3);
 const REPAIR_COOLDOWN_MS = Number(process.env.PI_PROXY_GUARD_REPAIR_COOLDOWN_MS ?? 90_000);
 const RECHECK_DELAY_MS = Number(process.env.PI_PROXY_GUARD_RECHECK_DELAY_MS ?? 8_000);
@@ -133,11 +82,17 @@ const NUDGE_TEXT =
 	"Connectivity has been verified again. Continue exactly where you left off.";
 const RESUME_TEXT = "continue";
 
+function originLabel(value: string | undefined): string {
+	if (!value) return "(none)";
+	try {const u=new URL(value);return `${u.protocol}//${u.host}`;} catch {return "(configured)";}
+}
+
 function log(message: string): void {
 	if (!LOG_FILE) return;
 	try {
 		mkdirSync(dirname(LOG_FILE), { recursive: true });
-		appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}\n`);
+		try {chmodSync(LOG_FILE,0o600);} catch { /* newly created by appendFileSync */ }
+		appendFileSync(LOG_FILE, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 });
 	} catch {
 		/* never let logging break the guard */
 	}
@@ -153,13 +108,16 @@ interface CheckResult {
 	ok: boolean;
 	status?: number;
 	error?: string;
+	repairable?: boolean;
 }
 
 function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; output?: string; error?: string }> {
 	return new Promise((resolve) => {
-		execFile(cmd, args, { timeout: timeoutMs }, (err, stdout, stderr) => {
+		execFile(cmd, args, { timeout: timeoutMs }, (err, stdout) => {
+			// ChildProcess error.message can contain command arguments, including
+			// private webhook URLs. Never log commands or URLs on failure.
 			resolve(err
-				? { ok: false, output: stdout, error: ((stderr || "") + err.message).split("\n")[0].trim() }
+				? { ok: false, output: stdout, error: `command failed (${String((err as NodeJS.ErrnoException).code ?? "unknown")})` }
 				: { ok: true, output: stdout });
 		});
 	});
@@ -168,15 +126,15 @@ function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: 
 /** Reachability probe: any HTTP response (even 404/401/502) means the
  *  transport path to the host is alive — that's what we measure, not
  *  whether the endpoint "succeeds". */
-function httpProbe(url: string): Promise<CheckResult> {
+function httpProbe(url: string, requireSuccess = false): Promise<CheckResult> {
 	return new Promise((resolve) => {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
 		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
 		args.push(url);
 		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000 }, (err, stdout) => {
 			const status = Number.parseInt((stdout ?? "").trim(), 10);
-			if (!err && status > 0) resolve({ ok: true, status });
-			else resolve({ ok: false, status: Number.isFinite(status) ? status : undefined, error: (err?.message ?? "").split("\n")[0] });
+			if (!err && (requireSuccess ? status >= 200 && status < 300 : transportReached(status))) resolve({ ok: true, status });
+			else resolve({ ok: false, status: Number.isFinite(status) ? status : undefined, error: `curl failed (${String((err as NodeJS.ErrnoException | null)?.code ?? "unknown")})` });
 		});
 	});
 }
@@ -193,20 +151,24 @@ function streamProbe(url: string): Promise<CheckResult> {
 			const [statusRaw, bytesRaw] = (stdout ?? "").trim().split(/\s+/);
 			const status = Number.parseInt(statusRaw, 10);
 			const bytes = Number.parseInt(bytesRaw, 10);
-			if (!err && status > 0 && bytes >= STREAM_MIN_BYTES) resolve({ ok: true, status });
+			if (!err && transferHealthy(status, bytes, STREAM_MIN_BYTES)) resolve({ ok: true, status });
 			else
 				resolve({
 					ok: false,
 					status: Number.isFinite(status) ? status : undefined,
-					error: err ? err.message.split("\n")[0] : `stream cut: got ${bytes}B < ${STREAM_MIN_BYTES}B`,
+					error: err ? `curl stream failed (${String((err as NodeJS.ErrnoException).code ?? "unknown")})` : `stream cut: got ${bytes}B < ${STREAM_MIN_BYTES}B`,
 				});
 		});
 	});
 }
 
-/** Optional fast path: the VPN tunnel state itself, zero network traffic. */
-async function tunnelUp(): Promise<boolean | undefined> {
-	if (!VPN_SERVICE) return undefined;
+/** Optional fast path: local sakamoto supervisor or an explicit legacy VPN service. */
+async function tunnelUp(backend: Backend, socketPath?: string): Promise<boolean | undefined> {
+	if (backend === "sakamoto") {
+		if (!socketPath) return false;
+		return (await supervisorStatus(socketPath)) === "connected";
+	}
+	if (backend !== "shadowrocket" || !VPN_SERVICE) return undefined;
 	const r = await execCmd("scutil", ["--nc", "show", VPN_SERVICE], 5_000);
 	if (!r.ok || r.output === undefined) return undefined;
 	return /\bConnected\b/.test(r.output) ? true : /\bDisconnected\b/.test(r.output) ? false : undefined;
@@ -214,7 +176,7 @@ async function tunnelUp(): Promise<boolean | undefined> {
 
 /** Back-compat shim: reachability via the configured CHECK_URL. */
 function checkProxy(): Promise<CheckResult> {
-	return httpProbe(CHECK_URL);
+	return httpProbe(CHECK_URL, true);
 }
 
 export default function (pi: ExtensionAPI) {
@@ -243,6 +205,9 @@ export default function (pi: ExtensionAPI) {
 	/** Session-scoped watchdog + captured context. */
 	let watchdog: ReturnType<typeof setInterval> | undefined;
 	let sessionCtx: ExtensionContext | undefined;
+	let sessionToken=0;
+	let supervisorSocket: string | undefined;
+	let backend: Backend = "none";
 
 	const budgetLeft = (): number => {
 		const cutoff = Date.now() - WINDOW_MS;
@@ -315,21 +280,20 @@ export default function (pi: ExtensionAPI) {
 	 *  or PI_PROXY_GUARD_API_URL) and adds a sustained-transfer check — the
 	 *  "can it hold an SSE stream" signal a 0-byte ping can't see.
 	 *  deep=false (watchdog): cheap generate_204 ping only. */
-	async function probe(ctx?: ExtensionContext, deep = false): Promise<CheckResult> {
-		const vpn = await tunnelUp();
-		if (vpn === false) return { ok: false, error: `VPN tunnel "${VPN_SERVICE}" disconnected` };
+	async function probe(ctx?: ExtensionContext, deep = false, resetEpisode = true): Promise<CheckResult> {
+		const vpn = await tunnelUp(backend, supervisorSocket);
+		if (vpn === false) return { ok: false, repairable: backend !== "sakamoto", error: backend === "sakamoto" ? "sakamoto supervisor is not connected" : `VPN tunnel "${VPN_SERVICE}" disconnected` };
 
 		const target = (deep ? (API_URL_OVERRIDE ?? ctx?.model?.baseUrl) : undefined) ?? CHECK_URL;
 		let last: CheckResult = { ok: false };
 		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
-			last = await httpProbe(target);
+			last = await httpProbe(target, !deep);
 			if (last.ok && deep && STREAM_MIN_BYTES > 0) {
 				const stream = await streamProbe(STREAM_URL);
 				if (!stream.ok) last = stream;
 			}
 			if (last.ok) {
-				failedRepairs = 0;
-				gaveUpNotified = false;
+				if (deep && resetEpisode) {failedRepairs=0;gaveUpNotified=false;}
 				return last;
 			}
 			if (attempt < PROBE_ATTEMPTS) {
@@ -340,11 +304,25 @@ export default function (pi: ExtensionAPI) {
 		return last;
 	}
 
+	/** Require two independent sustained-transfer successes before resuming Pi
+	 * after a paused network error or an attempted failover. */
+	async function verifyRecovery(ctx: ExtensionContext): Promise<CheckResult> {
+		const first=await probe(ctx,true,false);
+		if (!first.ok) return first;
+		if (PROBE_GAP_MS>0) await sleep(PROBE_GAP_MS);
+		const second=await probe(ctx,true,false);
+		if (second.ok) {failedRepairs=0;gaveUpNotified=false;}
+		return second;
+	}
+
 	/** True while we may still launch an active repair this down-episode. */
 	const mayRepair = (): boolean => failedRepairs < PAUSED_REPAIR_MAX;
 
-	/** Restart/switch the proxy. first success wins; each method rechecks. */
+	/** The sakamoto watcher alone owns MainProxy selection. The guard may wait
+	 * for its existing URLTest/fallback interval, but never writes a selector. */
 	async function repairProxy(ctx: ExtensionContext): Promise<boolean> {
+		const token=sessionToken;
+		if (backend === "none" || (backend === "sakamoto" && SAKAMOTO_MODE !== "recover")) return false;
 		if (Date.now() - lastRepairAt < REPAIR_COOLDOWN_MS) {
 			log("repair skipped: cooldown");
 			return false;
@@ -353,14 +331,22 @@ export default function (pi: ExtensionAPI) {
 		lastRepairAt = Date.now();
 		failedRepairs++;
 		try {
+			if (backend === "sakamoto") {
+				notify(ctx, "Waiting for sakamoto's existing automatic fallback; no selector or VPN restart requested…", "warning");
+				await sleep(Math.max(0, SAKAMOTO_WAIT_MS));
+				if (token!==sessionToken) return false;
+				const check = await verifyRecovery(ctx);
+				if (!check.ok) log(`sakamoto watcher did not recover the Pi path: ${check.error ?? `HTTP ${check.status}`}`);
+				return check.ok;
+			}
 			const recheck = async (): Promise<boolean> => {
 				await sleep(RECHECK_DELAY_MS);
-				const check = await probe(ctx, true); // deep: verify real capacity before unpausing
+				const check = await verifyRecovery(ctx); // confirm sustained capacity twice
 				if (!check.ok) log(`still down: ${check.error ?? `HTTP ${check.status}`}`);
 				return check.ok;
 			};
 			const viaShortcut = async (): Promise<boolean> => {
-				if (!SHORTCUT) return false;
+				if (!SHORTCUT || token!==sessionToken) return false;
 				notify(ctx, `Running shortcut "${SHORTCUT}"…`, "warning");
 				const res = await execCmd("shortcuts", ["run", SHORTCUT], SHORTCUT_TIMEOUT_MS);
 				if (!res.ok) {
@@ -370,7 +356,7 @@ export default function (pi: ExtensionAPI) {
 				return recheck();
 			};
 			const viaScheme = async (): Promise<boolean> => {
-				if (!USE_SCHEME) return false;
+				if (!USE_SCHEME || token!==sessionToken) return false;
 				notify(ctx, "Bouncing Shadowrocket via URL scheme…", "warning");
 				// `open -g`: background — do NOT activate/foreground Shadowrocket.
 				const stop = await execCmd("open", ["-g", SCHEME_STOP], 15_000);
@@ -397,7 +383,11 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
+		sessionToken++;
 		sessionCtx = ctx;
+		supervisorSocket = findSupervisorSocket();
+		backend = chooseBackend(BACKEND_REQUEST, Boolean(supervisorSocket));
+		log(`backend=${backend} mode=${backend === "sakamoto" ? SAKAMOTO_MODE : "legacy"}`);
 		pausedByUs = false;
 		repairs = [];
 		consecutiveErrors = 0;
@@ -406,18 +396,21 @@ export default function (pi: ExtensionAPI) {
 			watchdog = setInterval(() => {
 				void (async () => {
 					if (ticking || busy || repairing || !sessionCtx) return;
+					const token=sessionToken;
 					// Only spend effort when pi actually needs the connection:
 					// a live run (internal retries benefit) or a paused-by-us session.
 					if (!runActive && !pausedByUs) return;
 					ticking = true;
 					try {
-						const check = await probe(sessionCtx, false); // cheap ping for the periodic watch
+						const check = pausedByUs ? await verifyRecovery(sessionCtx) : await probe(sessionCtx, false);
+						if (token!==sessionToken || !sessionCtx) return;
 						if (check.ok) {
 							// Recovered while paused: resume.
 							if (pausedByUs && !runActive) {
+								if (budgetLeft() <= 0) return;
 								chargeBudget();
 								pausedByUs = false;
-								notify(sessionCtx, "Proxy verified OK — resuming paused session.");
+								notify(sessionCtx, "Proxy verified by deep check — resuming paused session.");
 								if (NOTIFY_RESUME) systemNotify("proxy recovered — session resumed");
 								pi.sendUserMessage(RESUME_TEXT, { deliverAs: "followUp" });
 							}
@@ -426,6 +419,7 @@ export default function (pi: ExtensionAPI) {
 						// Down: active repairs are capped at PAUSED_REPAIR_MAX per
 						// down-episode; afterwards we keep a cheap passive watch and
 						// still auto-resume when the proxy recovers on its own.
+						if (check.repairable === false || backend === "none" || (backend === "sakamoto" && SAKAMOTO_MODE === "observe")) return;
 						if (!mayRepair()) {
 							if (!gaveUpNotified) {
 								gaveUpNotified = true;
@@ -459,11 +453,14 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		sessionToken++;
 		if (watchdog) {
 			clearInterval(watchdog);
 			watchdog = undefined;
 		}
 		sessionCtx = undefined;
+		supervisorSocket = undefined;
+		backend = "none";
 		pausedByUs = false;
 		runActive = false;
 	});
@@ -496,54 +493,60 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (busy) return;
 		busy = true;
+		const token=sessionToken;
 		try {
+			// The boundary exposes an outcome, not a failure category. Only the
+			// assistant's final errorMessage is examined; never log prompt content.
+			const lastAssistant = [...event.context.contextMessages].reverse().find((message) => message.role === "assistant");
+			const kind = classifyProviderError(lastAssistant?.role === "assistant" ? (lastAssistant.errorMessage ?? "") : "");
+			if (kind !== "network") {
+				pausedByUs = false;
+				notify(ctx, `${kind === "provider" ? "Provider/account" : "Unclassified"} error; no proxy recovery or automatic continuation.`, "warning");
+				return;
+			}
 			consecutiveErrors++;
-			// If the watchdog is mid-repair, ride on its result instead of starting another.
 			await waitForRepair(SHORTCUT_TIMEOUT_MS + 30_000);
-
-			log(
-				`settle error #${consecutiveErrors}; canContinue=${event.context.canContinue}; ` +
-					`budget=${budgetLeft()}/${MAX_REPAIRS}; pausedByUs=${pausedByUs}`,
-			);
-			const check = await probe(ctx, true); // deep: API host + sustained transfer
-			const canContinue = budgetLeft() > 0;
-			if (!canContinue) {
-				// Budget is about *provider requests*, not connectivity: still
-				// repair a dead proxy so the user's manual take-over lands on a
-				// working network — then stay paused without continuing.
-				if (!check.ok) await repairProxy(ctx);
-				notify(ctx, `Auto-continue budget exhausted (${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min). Staying paused — take over manually.`, "warning");
+			if (token!==sessionToken) return;
+			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}`);
+			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.
+			if (token!==sessionToken) return;
+			if (budgetLeft() <= 0) {
+				pausedByUs = !check.ok;
+				notify(ctx, `Auto-continue budget exhausted (${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min). Staying paused.`, "warning");
 				systemNotify("auto-continue budget exhausted — session paused; check proxy or take over");
-				pausedByUs = true;
 				return;
 			}
-			const halfDead = check.ok && consecutiveErrors >= ESCALATE_AFTER;
-
-			if (!check.ok && !mayRepair()) {
-				// Repair already gave up this down-episode — don't hammer Shortcuts.
-				pausedByUs = true;
-				notify(ctx, `Proxy down; active repairs exhausted (${PAUSED_REPAIR_MAX}). Passive watch until it's back.`, "error");
-				systemNotify(`proxy down, repairs exhausted (${PAUSED_REPAIR_MAX}) — session paused`);
-				return;
-			}
-			if (!check.ok || halfDead) {
-				// Down, or ping-OK but streams keep dying -> repair.
-				if (!(await repairProxy(ctx))) {
-					// On the half-dead path the pre-repair check was OK: don't trust the
-					// failed repair to mean we're offline — verify once more.
-					const post = await probe(ctx, true);
-					if (!post.ok) {
-						pausedByUs = true;
-						notify(ctx, "Proxy still down after repair attempts. Staying paused; watchdog will auto-resume once it's back.", "error");
-						return;
-					}
+			if (!check.ok) {
+				if (check.repairable === false) {
+					pausedByUs = true;
+					notify(ctx, "sakamoto is disconnected. Waiting for a manual connection; the guard will not start the VPN.", "warning");
+					return;
 				}
-				notify(ctx, halfDead ? "Half-dead node — repaired before continuing." : "Proxy restored. Auto-continuing…");
+				if (backend === "sakamoto" && SAKAMOTO_MODE === "observe") {
+					pausedByUs = true;
+					notify(ctx, "Pi path down; sakamoto owns failover. Observe-only mode: no selector or tunnel changes.", "warning");
+					return;
+				}
+				if (!mayRepair()) {
+					pausedByUs = true;
+					notify(ctx, `Recovery attempts exhausted (${PAUSED_REPAIR_MAX}); passive deep verification continues.`, "error");
+					systemNotify(`proxy path still down after ${PAUSED_REPAIR_MAX} checks — session paused`);
+					return;
+				}
+				const recovered = shouldAttemptRecovery(kind, check.ok, backend) && await repairProxy(ctx);
+				if (token!==sessionToken) return;
+				if (!recovered) {
+					pausedByUs = true;
+					notify(ctx, "Proxy path still down. Staying paused; deep watchdog checks will resume on recovery.", "error");
+					return;
+				}
+				notify(ctx, "Pi proxy path verified after recovery; continuing.");
 			} else if (BACKOFF_MS > 0) {
 				await sleep(BACKOFF_MS);
-				notify(ctx, `Proxy OK (HTTP ${check.status}). Auto-continuing after error…`);
+				notify(ctx, `Pi proxy path verified (HTTP ${check.status}); continuing after transient error.`);
 			}
 
+			if (token!==sessionToken) return;
 			chargeBudget();
 			pausedByUs = false;
 
@@ -559,7 +562,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("proxyguard", {
-		description: "Proxy Guard: check/restart/status",
+		description: "Proxy Guard: check/recover/status",
 		handler: async (args, ctx) => {
 			const sub = (args ?? "").trim().split(/\s+/)[0] || "check";
 			if (sub === "check") {
@@ -569,19 +572,23 @@ export default function (pi: ExtensionAPI) {
 					check.ok ? `Proxy OK (HTTP ${check.status})` : `Proxy DOWN (${check.error ?? `HTTP ${check.status}`})`,
 					check.ok ? "info" : "error",
 				);
-			} else if (sub === "restart") {
-				const repaired = await repairProxy(ctx);
-				notify(ctx, repaired ? "Proxy restored." : "Proxy still down after repair.", repaired ? "info" : "error");
+			} else if (sub === "recover" || sub === "restart") {
+				if (backend === "sakamoto" && SAKAMOTO_MODE === "observe") {
+					notify(ctx, "Observe-only: sakamoto's watcher owns selection. No VPN restart or node switch requested.");
+				} else {
+					const recovered = await repairProxy(ctx);
+					notify(ctx, recovered ? "Pi proxy path verified." : "Pi proxy path still down; no automatic continuation.", recovered ? "info" : "warning");
+				}
 			} else if (sub === "status") {
 				notify(
 					ctx,
-					`ping=${CHECK_URL} api=${API_URL_OVERRIDE ?? ctx.model?.baseUrl ?? "(none)"} stream=${STREAM_MIN_BYTES > 0 ? STREAM_URL : "off"} vpn=${VPN_SERVICE || "off"} ` +
-						`proxy=${CHECK_PROXY ?? "(env)"} shortcut="${SHORTCUT || "off"}" scheme=${USE_SCHEME ? "on" : "off"} ` +
-						`escalateAfter=${ESCALATE_AFTER} budget=${budgetLeft()}/${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min ` +
+					`backend=${backend} sakamotoMode=${backend === "sakamoto" ? SAKAMOTO_MODE : "n/a"} ping=${originLabel(CHECK_URL)} api=${originLabel(API_URL_OVERRIDE ?? ctx.model?.baseUrl)} stream=${STREAM_MIN_BYTES > 0 ? originLabel(STREAM_URL) : "off"} vpn=${backend === "shadowrocket" ? (VPN_SERVICE || "off") : "sakamoto/none"} ` +
+						`proxy=${CHECK_PROXY ? originLabel(CHECK_PROXY) : "(env)"} shortcut="${backend === "shadowrocket" ? (SHORTCUT || "off") : "disabled"}" scheme=${backend === "shadowrocket" && USE_SCHEME ? "on" : "off"} ` +
+						`budget=${budgetLeft()}/${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min ` +
 						`watchdog=${WATCHDOG_MS}ms pausedByUs=${pausedByUs} consecErrs=${consecutiveErrors} failedRepairs=${failedRepairs}/${PAUSED_REPAIR_MAX} log=${LOG_FILE || "off"}`,
 				);
 			} else {
-				notify(ctx, "Usage: /proxyguard [check|restart|status]", "warning");
+				notify(ctx, "Usage: /proxyguard [check|recover|status] (restart remains a legacy alias)", "warning");
 			}
 		},
 	});
