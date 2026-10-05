@@ -16,6 +16,20 @@ export function classifyProviderError(message: string): FailureKind {
 	return "unknown";
 }
 
+/** A loopback API target (e.g. a local gateway such as magpie on
+ *  127.0.0.1:3425) can never be a proxy problem: VPN repair cannot reach
+ *  it, cannot fix it, and must not run. Probing it is still meaningful
+ *  for pause/auto-resume bookkeeping. */
+export function isLoopbackApiUrl(url: string | undefined): boolean {
+	if (!url) return false;
+	try {
+		const h = new URL(url).hostname.toLowerCase();
+		return h === "localhost" || h.endsWith(".localhost") || h === "127.0.0.1" || h === "0.0.0.0" || h === "::1" || h === "[::1]";
+	} catch {
+		return false;
+	}
+}
+
 // A 502 from a proxy is not proof that the requested HTTPS path works.
 export function transportReached(status: number): boolean {
 	return status >= 200 && status < 500;

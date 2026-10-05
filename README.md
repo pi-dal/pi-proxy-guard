@@ -11,6 +11,7 @@ A [Pi](https://github.com/earendil-works/pi) extension that recovers **network-f
 | Repeated deep Pi-path failure; sakamoto **observe** mode (default) | Stay paused while sakamoto's independent watcher works. Deep-check again later; never restart or select a node. |
 | Repeated deep failure; sakamoto **recover** mode | Call `sakamoto recover` once, wait for watcher-owned URL tests (default 45s), then require two fresh deep successes before continuing. If still down, stay paused and notify. |
 | Sakamoto supervisor deliberately disconnected | Do not start the VPN. Stay paused until the user connects it. |
+| API target is loopback (e.g. a local gateway such as magpie on `127.0.0.1:3425`) | Proxy recovery cannot apply and never runs — no tunnel gate, no sustained-transfer check. Stay paused; deep probes auto-resume when the endpoint answers. |
 
 A deep check queries the active model API host for transport reachability and downloads at least 60 KB from an independent endpoint. A cheap 204 probe alone cannot resume a paused session. Three consecutive failed attempts (default) avoid switching because of one latency spike. A verified recovery must pass **two** sustained-transfer checks. Provider-request budgets, repair cooldowns and passive monitoring remain in force.
 

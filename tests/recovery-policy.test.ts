@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chooseBackend, classifyProviderError, shouldAttemptRecovery, transferHealthy, transportReached } from "../extensions/recovery-policy.ts";
+import { chooseBackend, classifyProviderError, isLoopbackApiUrl, shouldAttemptRecovery, transferHealthy, transportReached } from "../extensions/recovery-policy.ts";
 import { findSupervisorSocket, supervisorStatus } from "../extensions/sakamoto-adapter.ts";
 
 test("sakamoto is preferred; Shadowrocket is never an implicit fallback", () => {
@@ -28,6 +28,15 @@ test("only transport-like errors can propose recovery", () => {
 	assert.equal(shouldAttemptRecovery("network", true, "sakamoto"), false);
 	assert.equal(shouldAttemptRecovery("network", false, "none"), false);
 	assert.equal(shouldAttemptRecovery("network", false, "sakamoto"), true);
+});
+
+test("loopback API targets are recognised (local gateway cannot be a proxy problem)", () => {
+	for (const url of ["http://127.0.0.1:3425/v1", "http://localhost:3425", "http://[::1]:8080", "http://gw.localhost:9"]) {
+		assert.equal(isLoopbackApiUrl(url), true, url);
+	}
+	for (const url of ["https://api.openai.com/v1", "https://relay.example.com/v1", undefined, "", "not a url"]) {
+		assert.equal(isLoopbackApiUrl(url), false, url);
+	}
 });
 
 test("proxy 502 and small error pages never pass sustained transfer", () => {

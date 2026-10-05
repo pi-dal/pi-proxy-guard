@@ -1,6 +1,6 @@
 {
 	"name": "pi-proxy-guard",
-	"version": "0.7.1",
+	"version": "0.7.2",
 	"description": "Recover pi sessions via verified proxy health and sakamoto-owned fallback; Shadowrocket repair is explicit legacy opt-in.",
 	"scripts": {
 		"test": "node --test tests/*.test.ts",

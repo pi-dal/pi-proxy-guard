@@ -30,30 +30,40 @@ import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { chooseBackend, classifyProviderError, shouldAttemptRecovery, transferHealthy, transportReached, type Backend } from "./recovery-policy.ts";
+import { chooseBackend, classifyProviderError, isLoopbackApiUrl, shouldAttemptRecovery, transferHealthy, transportReached, type Backend } from "./recovery-policy.ts";
 import { findSupervisorSocket, supervisorStatus } from "./sakamoto-adapter.ts";
 
-const DISABLED = process.env.PI_PROXY_GUARD === "0";
-const CHECK_URL = process.env.PI_PROXY_GUARD_URL ?? "https://www.google.com/generate_204";
-const API_URL_OVERRIDE = process.env.PI_PROXY_GUARD_API_URL;
-const STREAM_URL = process.env.PI_PROXY_GUARD_STREAM_URL ?? "https://speed.cloudflare.com/__down?bytes=65536";
+/** Shell rc files occasionally wrap a value in literal quotes
+ *  (`export VAR="\"https://…\""`), which hands tools like curl a
+ *  malformed URL (exit 3). Strip one surrounding quote pair. */
+function envStr(name: string, fallback = ""): string {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const t = raw.trim();
+	return t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) ? t.slice(1, -1) : t;
+}
+
+const DISABLED = envStr("PI_PROXY_GUARD") === "0";
+const CHECK_URL = envStr("PI_PROXY_GUARD_URL", "https://www.google.com/generate_204");
+const API_URL_OVERRIDE = envStr("PI_PROXY_GUARD_API_URL") || undefined;
+const STREAM_URL = envStr("PI_PROXY_GUARD_STREAM_URL", "https://speed.cloudflare.com/__down?bytes=65536");
 const STREAM_MIN_BYTES = Number(process.env.PI_PROXY_GUARD_STREAM_MIN_BYTES ?? 60_000);
-const VPN_SERVICE = process.env.PI_PROXY_GUARD_VPN_SERVICE ?? "";
-const CHECK_PROXY = process.env.PI_PROXY_GUARD_PROXY;
+const VPN_SERVICE = envStr("PI_PROXY_GUARD_VPN_SERVICE");
+const CHECK_PROXY = envStr("PI_PROXY_GUARD_PROXY") || undefined;
 const CHECK_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_TIMEOUT_MS ?? 20_000);
 const PROBE_ATTEMPTS = Number(process.env.PI_PROXY_GUARD_PROBE_ATTEMPTS ?? 3);
 const PROBE_GAP_MS = Number(process.env.PI_PROXY_GUARD_PROBE_GAP_MS ?? 1_500);
-const BACKEND_REQUEST = process.env.PI_PROXY_GUARD_BACKEND;
-const SAKAMOTO_MODE = process.env.PI_PROXY_GUARD_SAKAMOTO_MODE === "recover" ? "recover" : "observe";
+const BACKEND_REQUEST = envStr("PI_PROXY_GUARD_BACKEND") || undefined;
+const SAKAMOTO_MODE = envStr("PI_PROXY_GUARD_SAKAMOTO_MODE") === "recover" ? "recover" : "observe";
 const SAKAMOTO_WAIT_MS = Number(process.env.PI_PROXY_GUARD_SAKAMOTO_WAIT_MS ?? 45_000);
-const SAKAMOTO_BIN = process.env.PI_PROXY_GUARD_SAKAMOTO_BIN ?? "sakamoto";
-const SHORTCUT = process.env.PI_PROXY_GUARD_SHORTCUT ?? "Reconnect Shadowrocket";
+const SAKAMOTO_BIN = envStr("PI_PROXY_GUARD_SAKAMOTO_BIN", "sakamoto");
+const SHORTCUT = envStr("PI_PROXY_GUARD_SHORTCUT", "Reconnect Shadowrocket");
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
 // Verified against Shadowrocket's docs: connect/disconnect (not start/stop).
 // autoclose=true lets the app quit itself after handling the action.
-const SCHEME_STOP = process.env.PI_PROXY_GUARD_SCHEME_STOP ?? "shadowrocket://disconnect?autoclose=true";
-const SCHEME_START = process.env.PI_PROXY_GUARD_SCHEME_START ?? "shadowrocket://connect?autoclose=true";
+const SCHEME_STOP = envStr("PI_PROXY_GUARD_SCHEME_STOP", "shadowrocket://disconnect?autoclose=true");
+const SCHEME_START = envStr("PI_PROXY_GUARD_SCHEME_START", "shadowrocket://connect?autoclose=true");
 const PAUSED_REPAIR_MAX = Number(process.env.PI_PROXY_GUARD_PAUSED_REPAIRS ?? 3);
 const REPAIR_COOLDOWN_MS = Number(process.env.PI_PROXY_GUARD_REPAIR_COOLDOWN_MS ?? 90_000);
 const RECHECK_DELAY_MS = Number(process.env.PI_PROXY_GUARD_RECHECK_DELAY_MS ?? 8_000);
@@ -61,22 +71,23 @@ const BACKOFF_MS = Number(process.env.PI_PROXY_GUARD_BACKOFF_MS ?? 3_000);
 const MAX_REPAIRS = Number(process.env.PI_PROXY_GUARD_MAX_REPAIRS ?? 5);
 const WINDOW_MS = Number(process.env.PI_PROXY_GUARD_WINDOW_MS ?? 600_000);
 const WATCHDOG_MS = Number(process.env.PI_PROXY_GUARD_WATCHDOG_MS ?? 60_000);
-const NOTIFY_CHANNELS = process.env.PI_PROXY_GUARD_NOTIFY === "0" || process.env.PI_PROXY_GUARD_NOTIFY === "off"
+const NOTIFY_CHANNELS_RAW = envStr("PI_PROXY_GUARD_NOTIFY", "macos,bark,webhook");
+const NOTIFY_CHANNELS = NOTIFY_CHANNELS_RAW === "0" || NOTIFY_CHANNELS_RAW === "off"
 	? []
-	: (process.env.PI_PROXY_GUARD_NOTIFY ?? "macos,bark,webhook").split(",").map((s) => s.trim()).filter(Boolean);
-const NOTIFY_RESUME = process.env.PI_PROXY_GUARD_NOTIFY_RESUME === "1";
+	: NOTIFY_CHANNELS_RAW.split(",").map((s) => s.trim()).filter(Boolean);
+const NOTIFY_RESUME = envStr("PI_PROXY_GUARD_NOTIFY_RESUME") === "1";
 const NOTIFY_COOLDOWN_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS ?? 600_000);
-const BARK = process.env.PI_PROXY_GUARD_BARK ?? "";
-const WEBHOOK = process.env.PI_PROXY_GUARD_WEBHOOK ?? "";
+const BARK = envStr("PI_PROXY_GUARD_BARK");
+const WEBHOOK = envStr("PI_PROXY_GUARD_WEBHOOK");
 const PUSH_TITLE = "pi proxy-guard";
 /** Push a "Pi finished" notification only for clean completes lasting >=
  *  this long. 0 disables. Beats pi-bark's blanket agent_settled push:
  *  outcome-aware (no false "finished" on error settles) + duration gate. */
 const NOTIFY_FINISH_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_FINISH_MS ?? 0);
 const LOG_FILE =
-	process.env.PI_PROXY_GUARD_LOG !== ""
-		? (process.env.PI_PROXY_GUARD_LOG ?? join(homedir(), ".pi", "agent", "proxy-guard.log"))
-		: "";
+	process.env.PI_PROXY_GUARD_LOG === "" || envStr("PI_PROXY_GUARD_LOG") === ""
+		? process.env.PI_PROXY_GUARD_LOG === "" ? "" : join(homedir(), ".pi", "agent", "proxy-guard.log")
+		: envStr("PI_PROXY_GUARD_LOG");
 
 const NUDGE_CUSTOM_TYPE = "proxy-guard-recovery";
 const NUDGE_TEXT =
@@ -283,14 +294,19 @@ export default function (pi: ExtensionAPI) {
 	 *  "can it hold an SSE stream" signal a 0-byte ping can't see.
 	 *  deep=false (watchdog): cheap generate_204 ping only. */
 	async function probe(ctx?: ExtensionContext, deep = false, resetEpisode = true): Promise<CheckResult> {
-		const vpn = await tunnelUp(backend, supervisorSocket);
-		if (vpn === false) return { ok: false, repairable: backend !== "sakamoto", error: backend === "sakamoto" ? "sakamoto supervisor is not connected" : `VPN tunnel "${VPN_SERVICE}" disconnected` };
-
 		const target = (deep ? (API_URL_OVERRIDE ?? ctx?.model?.baseUrl) : undefined) ?? CHECK_URL;
+		// A loopback API target (a local gateway such as magpie) is not reached
+		// through the VPN: skip the tunnel gate and the sustained-transfer check
+		// — a dead proxy must not mask "the local gateway is back up".
+		const loopback = deep && isLoopbackApiUrl(target);
+		if (!loopback) {
+			const vpn = await tunnelUp(backend, supervisorSocket);
+			if (vpn === false) return { ok: false, repairable: backend !== "sakamoto", error: backend === "sakamoto" ? "sakamoto supervisor is not connected" : `VPN tunnel "${VPN_SERVICE}" disconnected` };
+		}
 		let last: CheckResult = { ok: false };
 		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
 			last = await httpProbe(target, !deep);
-			if (last.ok && deep && STREAM_MIN_BYTES > 0) {
+			if (last.ok && deep && !loopback && STREAM_MIN_BYTES > 0) {
 				const stream = await streamProbe(STREAM_URL);
 				if (!stream.ok) last = stream;
 			}
@@ -324,6 +340,11 @@ export default function (pi: ExtensionAPI) {
 	 * for its existing URLTest/fallback interval, but never writes a selector. */
 	async function repairProxy(ctx: ExtensionContext): Promise<boolean> {
 		const token=sessionToken;
+		// Loopback API targets are unreachable by definition of VPN repair.
+		if (isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
+			log("loopback API target — proxy repair skipped");
+			return false;
+		}
 		if (backend === "none" || (backend === "sakamoto" && SAKAMOTO_MODE !== "recover")) return false;
 		if (Date.now() - lastRepairAt < REPAIR_COOLDOWN_MS) {
 			log("repair skipped: cooldown");
@@ -520,6 +541,14 @@ export default function (pi: ExtensionAPI) {
 			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}`);
 			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.
 			if (token!==sessionToken) return;
+			if (!check.ok && isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
+				// e.g. magpie's gateway stopped: VPN repair cannot reach a loopback
+				// target. Stay paused; the watchdog's deep probes auto-resume the
+				// session once it answers again.
+				pausedByUs = true;
+				notify(ctx, "API target is loopback — proxy recovery cannot apply. Pausing; auto-resume once the local endpoint answers.", "warning");
+				return;
+			}
 			if (budgetLeft() <= 0) {
 				pausedByUs = !check.ok;
 				notify(ctx, `Auto-continue budget exhausted (${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min). Staying paused.`, "warning");
