@@ -136,7 +136,10 @@ interface CheckResult {
 
 function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; output?: string; error?: string }> {
 	return new Promise((resolve) => {
-		execFile(cmd, args, { timeout: timeoutMs }, (err, stdout) => {
+		// SIGKILL on timeout: SIGTERM is ignorable and leaves half-dead
+		// children (curl waiting on a dead socket) around long enough to
+		// confuse subsequent execFile calls.
+		execFile(cmd, args, { timeout: timeoutMs, killSignal: "SIGKILL" }, (err, stdout) => {
 			// ChildProcess error.message can contain command arguments, including
 			// private webhook URLs. Never log commands or URLs on failure.
 			resolve(err
@@ -167,7 +170,7 @@ function httpProbe(url: string, requireSuccess = false): Promise<CheckResult> {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
 		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
 		args.push(url);
-		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000 }, (err, stdout) => {
+		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000, killSignal: "SIGKILL" }, (err, stdout) => {
 			const status = Number.parseInt((stdout ?? "").trim(), 10);
 			if (!err && (requireSuccess ? status >= 200 && status < 300 : transportReached(status))) resolve({ ok: true, status });
 			else resolve({ ok: false, status: Number.isFinite(status) ? status : undefined, error: `curl failed (${String((err as NodeJS.ErrnoException | null)?.code ?? "unknown")})` });
@@ -183,7 +186,7 @@ function streamProbe(url: string): Promise<CheckResult> {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code} %{size_download}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
 		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
 		args.push(url);
-		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000 }, (err, stdout) => {
+		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000, killSignal: "SIGKILL" }, (err, stdout) => {
 			const [statusRaw, bytesRaw] = (stdout ?? "").trim().split(/\s+/);
 			const status = Number.parseInt(statusRaw, 10);
 			const bytes = Number.parseInt(bytesRaw, 10);
@@ -335,6 +338,11 @@ export default function (pi: ExtensionAPI) {
 		}
 		let last: CheckResult = { ok: false };
 		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
+			// deep=false (watchdog ping): require 2xx from generate_204 — a
+			// 502 means the proxy itself is broken even though TCP worked.
+			// deep=true (API host): any HTTP response <500 counts — 401/404
+			// prove the transport reached the upstream (that's what we're
+			// measuring), 5xx means the proxy/upstream is still broken.
 			last = await httpProbe(target, !deep);
 			if (last.ok && deep && !loopback && STREAM_MIN_BYTES > 0) {
 				const stream = await streamProbe(STREAM_URL);
@@ -543,6 +551,13 @@ export default function (pi: ExtensionAPI) {
 						}
 					} catch (err) {
 						log(`watchdog error: ${err instanceof Error ? err.message : String(err)}`);
+						// Treat an unexpected watchdog exception the same as a failed
+						// probe: back off rather than hammering every 60s.
+						if (pausedByUs) {
+							watchdogFailStreak++;
+							const gap = Math.min(WATCHDOG_MS * (1 << Math.min(watchdogFailStreak, 4)), WATCHDOG_MAX_GAP_MS);
+							watchdogNextTickAt = Date.now() + gap;
+						}
 					} finally {
 						ticking = false;
 					}
@@ -597,7 +612,16 @@ export default function (pi: ExtensionAPI) {
 			consecutiveErrors = 0;
 			return;
 		}
-		if (busy) return;
+		// If a previous settle is still running, wait briefly rather than
+		// dropping this error entirely. Two settle errors in a row are common
+		// (e.g. provider retry -> second failure), and we shouldn't lose the
+		// second one's verdict just because the first is mid-verify.
+		const busyDeadline = Date.now() + 30_000;
+		while (busy && Date.now() < busyDeadline) await sleep(250);
+		if (busy) {
+			log("settle skipped: previous settle still busy after 30s");
+			return;
+		}
 		busy = true;
 		const token=sessionToken;
 		try {
@@ -613,19 +637,22 @@ export default function (pi: ExtensionAPI) {
 			consecutiveErrors++;
 			// Wait for any in-flight watchdog tick or repair before deciding —
 			// otherwise both paths can race to sendUserMessage/chargeBudget.
-			await waitForTick(SHORTCUT_TIMEOUT_MS + 30_000);
+			// Deadline must exceed the worst-case repairProxy duration:
+			// execFirst (3×5s) + SAKAMOTO_WAIT_MS (45s) + verifyRecovery (~2×64s).
+			await waitForTick(SAKAMOTO_WAIT_MS + CHECK_TIMEOUT_MS * PROBE_ATTEMPTS * 2 + 60_000);
 			if (token!==sessionToken) return;
 			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}`);
-			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.
-			if (token!==sessionToken) return;
-			if (!check.ok && isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
-				// e.g. magpie's gateway stopped: VPN repair cannot reach a loopback
-				// target. Stay paused; the watchdog's deep probes auto-resume the
-				// session once it answers again.
+			// Loopback API target (local gateway like magpie) — proxy recovery
+			// cannot reach it. Pause and let the watchdog's deep probes
+			// auto-resume once the local endpoint answers. Check this BEFORE
+			// burning a verifyRecovery pass that can only fail.
+			if (isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
 				pausedByUs = true;
 				notify(ctx, "API target is loopback — proxy recovery cannot apply. Pausing; auto-resume once the local endpoint answers.", "warning");
 				return;
 			}
+			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.
+			if (token!==sessionToken) return;
 			if (budgetLeft() <= 0) {
 				pausedByUs = !check.ok;
 				notify(ctx, `Auto-continue budget exhausted (${MAX_REPAIRS}/${Math.round(WINDOW_MS / 60_000)}min). Staying paused.`, "warning");
@@ -663,14 +690,17 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (token!==sessionToken) return;
-			chargeBudget();
 			pausedByUs = false;
 
 			// Errored assistant message = last context message -> canContinue=false.
 			// Append a custom_message draft (projects to a `user` message) to unblock.
+			// Only charge the budget when we actually ask pi to continue — if
+			// canContinue is already true the provider retry would have happened
+			// anyway and isn't ours to spend.
 			const entries = event.context.canContinue
 				? undefined
 				: [{ type: "custom_message" as const, customType: NUDGE_CUSTOM_TYPE, content: NUDGE_TEXT, display: false }];
+			if (entries) chargeBudget();
 			return entries ? { entries, continue: true } : { continue: true };
 		} finally {
 			busy = false;
