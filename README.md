@@ -46,7 +46,7 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 
 `PI_PROXY_GUARD_NOTIFY="macos,bark,webhook"` enables configured channels (default); `0` disables all. Bark and webhook URLs are secrets—never add them to git or logs. The guard creates its own diagnostic log with mode `0600` and redacts credentials from status and command errors. A Bark URL can be supplied as `PI_PROXY_GUARD_BARK`; a JSON webhook uses `PI_PROXY_GUARD_WEBHOOK`. Notifications are throttled by `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS`. Curl's `--noproxy '*'` bypasses the HTTP proxy for notifications but **does not bypass TUN routing**, so delivery during a full network outage is not guaranteed.
 
-`PI_PROXY_GUARD_NOTIFY_FINISH_MS=120000` enables a duration-gated "Pi finished" message only when the Pi run actually completed and went idle; failed settles are not sent as successful completions. `PI_PROXY_GUARD_NOTIFY_RESUME=1` also announces recovery.
+`PI_PROXY_GUARD_NOTIFY_FINISH_MS=0` (default) — duration-gated "Pi finished" message. Set explicitly (e.g. `120000`) only when pi-bark isn't installed: the extension auto-disables this push if `~/.pi/agent/config/pi-bark/config.json` exists, to avoid double-firing alongside pi-bark's settle listener. `PI_PROXY_GUARD_NOTIFY_FINISH_IGNORE_BARK=1` overrides the detection. `PI_PROXY_GUARD_NOTIFY_RESUME=1` also announces recovery.
 
 ## Configuration
 
@@ -73,7 +73,7 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 | `PI_PROXY_GUARD_VPN_SERVICE` | unset | Optional `scutil --nc` service used **only** for the explicit Shadowrocket backend. |
 | `PI_PROXY_GUARD_SHORTCUT` / `PI_PROXY_GUARD_SCHEME` | `Reconnect Shadowrocket` / `1` | **Legacy backend only**. Neither runs under sakamoto/none. |
 | `PI_PROXY_GUARD_NOTIFY` / `PI_PROXY_GUARD_NOTIFY_RESUME` | `macos,bark,webhook` / `0` | Notification channels and optional resume push. |
-| `PI_PROXY_GUARD_NOTIFY_FINISH_MS` / `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS` | `0` / `600000` | Completion threshold and push throttle. |
+| `PI_PROXY_GUARD_NOTIFY_FINISH_MS` / `PI_PROXY_GUARD_NOTIFY_COOLDOWN_MS` | `0` / `600000` | Completion threshold and push throttle. `FINISH_MS` auto-disables when pi-bark config is present; `PI_PROXY_GUARD_NOTIFY_FINISH_IGNORE_BARK=1` overrides. |
 | `PI_PROXY_GUARD_LOG` | `~/.pi/agent/proxy-guard.log` | Empty string disables the diagnostic log. |
 
 For emergency rollback set `PI_PROXY_GUARD=0` and reload Pi when idle; this does not touch sakamoto or its running VPN. The extension neither exposes nor prints the sakamoto API secret.

@@ -26,7 +26,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { execFile } from "node:child_process";
-import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -86,9 +86,25 @@ const BARK = envStr("PI_PROXY_GUARD_BARK");
 const WEBHOOK = envStr("PI_PROXY_GUARD_WEBHOOK");
 const PUSH_TITLE = "pi proxy-guard";
 /** Push a "Pi finished" notification only for clean completes lasting >=
- *  this long. 0 disables. Beats pi-bark's blanket agent_settled push:
- *  outcome-aware (no false "finished" on error settles) + duration gate. */
-const NOTIFY_FINISH_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_FINISH_MS ?? 0);
+ *  this long. Default 0 (disabled): pi-bark already pushes on every idle
+ *  settle and would double-fire alongside us. We also auto-disable when
+ *  pi-bark's config exists (~/.pi/agent/config/pi-bark/config.json) unless
+ *  PI_PROXY_GUARD_NOTIFY_FINISH_IGNORE_BARK=1 overrides the detection.
+ *  Enable explicitly when pi-bark isn't installed — this version is
+ *  outcome-aware (no false "finished" on error settles) + duration-gated. */
+const NOTIFY_FINISH_MS_RAW = Number(process.env.PI_PROXY_GUARD_NOTIFY_FINISH_MS ?? 0);
+const NOTIFY_FINISH_IGNORE_BARK = envStr("PI_PROXY_GUARD_NOTIFY_FINISH_IGNORE_BARK") === "1";
+function piBarkConfigPresent(): boolean {
+	try {
+		return existsSync(join(homedir(), ".pi", "agent", "config", "pi-bark", "config.json"));
+	} catch {
+		return false;
+	}
+}
+const NOTIFY_FINISH_MS =
+	NOTIFY_FINISH_MS_RAW > 0 && !NOTIFY_FINISH_IGNORE_BARK && piBarkConfigPresent()
+		? 0
+		: NOTIFY_FINISH_MS_RAW;
 // PI_PROXY_GUARD_LOG === "" explicitly disables the diagnostic log. When
 // unset it defaults to ~/.pi/agent/proxy-guard.log; any other value is the
 // destination path (quotes stripped by envStr).
@@ -481,6 +497,9 @@ export default function (pi: ExtensionAPI) {
 		supervisorSocket = findSupervisorSocket();
 		backend = chooseBackend(BACKEND_REQUEST, Boolean(supervisorSocket));
 		log(`backend=${backend} mode=${backend === "sakamoto" ? SAKAMOTO_MODE : "legacy"}`);
+		if (NOTIFY_FINISH_MS_RAW > 0 && NOTIFY_FINISH_MS === 0) {
+			log("finish notifications suppressed — pi-bark config detected (set PI_PROXY_GUARD_NOTIFY_FINISH_IGNORE_BARK=1 to override)");
+		}
 		pausedByUs = false;
 		repairs = [];
 		consecutiveErrors = 0;
