@@ -30,6 +30,42 @@ test("only transport-like errors can propose recovery", () => {
 	assert.equal(shouldAttemptRecovery("network", false, "sakamoto"), true);
 });
 
+test("real-world assistant errorMessage patterns classify correctly", () => {
+	// Sampled from ~/.pi/agent/sessions logs — these were falling through to
+	// "unknown" and spamming "Unclassified error" warnings.
+	const network = [
+		"server_error: Codex: connection lost mid-reply (unexpected EOF)",
+		"Codex: connection lost mid-reply (unexpected EOF)",
+		"terminated",
+		"Operation aborted",
+		"This operation was aborted",
+		"Aborted",
+		"Aborted after 1 retry attempt",
+		"Connection error.",
+		"Error reading response: malformed server-sent event JSON.",
+		'magpie API error (502): {"code":null,"message":"Codex: Post \\"https://chatgpt.com/backend-api/codex/responses\\": read tcp 127.0.0.1:55324->127.0.0.1:2334: read: connection reset by peer"}',
+		'server_error: Codex: Post "https://chatgpt.com/backend-api/codex/responses": dial tcp: lookup chatgpt.com: no such host',
+		"Codex SSE response headers timed out after 300000ms",
+		"Codex: connection lost mid-reply (stream error: stream ID 27; INTERNAL_ERROR; received from peer)",
+	];
+	for (const m of network) assert.equal(classifyProviderError(m), "network", m);
+
+	const provider = [
+		'magpie API error (502): {"code":null,"message":"Codex: x@y.z\'s sign-in has expired — add the account again to use it"}',
+		'server_error: Codex: x@y.z\'s sign-in has expired — add the account again to use it',
+		'magpie API error (401): {"code":null,"message":"Codex: Your authentication token has expired. Please try refreshing it."}',
+		"Our servers are currently overloaded. Please try again later.",
+		"Codex error: Our servers are currently overloaded. Please try again later.",
+		'429: {"code":null,"message":"Devin: usage limit reached: Reached free model rate limit"}',
+		"This content was flagged for possible cybersecurity risk.",
+	];
+	for (const m of provider) assert.equal(classifyProviderError(m), "provider", m);
+
+	// Still genuinely unknown — must not be silently promoted.
+	assert.equal(classifyProviderError("Cannot find module '/opt/x/y.js'"), "unknown");
+	assert.equal(classifyProviderError("tool compilation failed"), "unknown");
+});
+
 test("loopback API targets are recognised (local gateway cannot be a proxy problem)", () => {
 	for (const url of ["http://127.0.0.1:3425/v1", "http://localhost:3425", "http://[::1]:8080", "http://gw.localhost:9"]) {
 		assert.equal(isLoopbackApiUrl(url), true, url);
