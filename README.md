@@ -55,7 +55,7 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 | `PI_PROXY_GUARD` | `1` | `0` disables the extension. |
 | `PI_PROXY_GUARD_BACKEND` | `auto` | `auto` finds sakamoto's local supervisor; `sakamoto` requires it; `shadowrocket` explicitly enables legacy repair; `none` never repairs. |
 | `PI_PROXY_GUARD_SAKAMOTO_MODE` | `observe` | `recover` waits for watcher-owned fallback, without selector or VPN writes. |
-| `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for triggered URL tests and settle cycle. |
+| `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for triggered URL tests and settle cycle. A `busy`/`cooldown` reply piggybacks on the watcher's in-flight work and does not consume `PI_PROXY_GUARD_PAUSED_REPAIRS`. |
 | `PI_PROXY_GUARD_SAKAMOTO_BIN` | `sakamoto` | CLI invoked with `recover`; on PATH miss it falls back to `/opt/homebrew/bin/sakamoto` then `/usr/local/bin/sakamoto`. No API secret is passed. |
 | `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | Cheap watchdog probe; requires HTTP 2xx. |
 | `PI_PROXY_GUARD_API_URL` | current model base URL | API host for a deep transport check; 5xx is not a successful path. |
@@ -67,7 +67,7 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 | `PI_PROXY_GUARD_PROBE_GAP_MS` | `1500` | Delay between attempts and independent recovery checks. |
 | `PI_PROXY_GUARD_PAUSED_REPAIRS` | `3` | Maximum active waits/repairs in one outage episode. |
 | `PI_PROXY_GUARD_REPAIR_COOLDOWN_MS` | `90000` | Minimum gap between recovery attempts. |
-| `PI_PROXY_GUARD_WATCHDOG_MS` | `60000` | Watch an active or paused run; `0` disables it. |
+| `PI_PROXY_GUARD_WATCHDOG_MS` | `60000` | Base watch interval while a run is live or the session is paused-by-us; `0` disables it. When paused, the interval doubles on each failed verification, capped at 10 minutes — prolonged outages don't probe every minute for hours. |
 | `PI_PROXY_GUARD_MAX_REPAIRS` / `PI_PROXY_GUARD_WINDOW_MS` | `5` / `600000` | Rolling provider auto-continue budget. |
 | `PI_PROXY_GUARD_BACKOFF_MS` / `PI_PROXY_GUARD_RECHECK_DELAY_MS` | `3000` / `8000` | Delays for continuation/explicit legacy repair. |
 | `PI_PROXY_GUARD_VPN_SERVICE` | unset | Optional `scutil --nc` service used **only** for the explicit Shadowrocket backend. |

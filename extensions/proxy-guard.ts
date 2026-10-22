@@ -89,16 +89,21 @@ const PUSH_TITLE = "pi proxy-guard";
  *  this long. 0 disables. Beats pi-bark's blanket agent_settled push:
  *  outcome-aware (no false "finished" on error settles) + duration gate. */
 const NOTIFY_FINISH_MS = Number(process.env.PI_PROXY_GUARD_NOTIFY_FINISH_MS ?? 0);
-const LOG_FILE =
-	process.env.PI_PROXY_GUARD_LOG === "" || envStr("PI_PROXY_GUARD_LOG") === ""
-		? process.env.PI_PROXY_GUARD_LOG === "" ? "" : join(homedir(), ".pi", "agent", "proxy-guard.log")
-		: envStr("PI_PROXY_GUARD_LOG");
+// PI_PROXY_GUARD_LOG === "" explicitly disables the diagnostic log. When
+// unset it defaults to ~/.pi/agent/proxy-guard.log; any other value is the
+// destination path (quotes stripped by envStr).
+const LOG_FILE = (() => {
+	const raw = process.env.PI_PROXY_GUARD_LOG;
+	if (raw !== undefined && envStr("PI_PROXY_GUARD_LOG") === "") return "";
+	if (raw === undefined) return join(homedir(), ".pi", "agent", "proxy-guard.log");
+	return envStr("PI_PROXY_GUARD_LOG");
+})();
 
 const NUDGE_CUSTOM_TYPE = "proxy-guard-recovery";
 const NUDGE_TEXT =
 	"[proxy-guard] The previous model request failed with a network error (stream cut, retries exhausted). " +
 	"Connectivity has been verified again. Continue exactly where you left off.";
-const RESUME_TEXT = "continue";
+const RESUME_TEXT = "[proxy-guard] connection verified — please resume where you left off";
 
 function originLabel(value: string | undefined): string {
 	if (!value) return "(none)";
@@ -205,11 +210,6 @@ async function tunnelUp(backend: Backend, socketPath?: string): Promise<boolean 
 	return /\bConnected\b/.test(r.output) ? true : /\bDisconnected\b/.test(r.output) ? false : undefined;
 }
 
-/** Back-compat shim: reachability via the configured CHECK_URL. */
-function checkProxy(): Promise<CheckResult> {
-	return httpProbe(CHECK_URL, true);
-}
-
 export default function (pi: ExtensionAPI) {
 	if (DISABLED) return;
 
@@ -234,6 +234,12 @@ export default function (pi: ExtensionAPI) {
 	 *  banner storm when a condition repeats every repair cycle. */
 	let lastUiNotifyAt = 0;
 	const UI_NOTIFY_COOLDOWN_MS = 60_000;
+	/** Watchdog exponential backoff state. While paused we still want
+	 *  auto-resume, but polling every WATCHDOG_MS for hours wastes
+	 *  probes; double the gap on each failed check, capped at 10 min. */
+	let watchdogFailStreak = 0;
+	let watchdogNextTickAt = 0;
+	const WATCHDOG_MAX_GAP_MS = 10 * 60_000;
 	let runStartedAt = 0;
 	/** outcome of the most recent settle boundary; agent_settled has none. */
 	let lastSettleOutcome = "";
@@ -253,10 +259,12 @@ export default function (pi: ExtensionAPI) {
 		repairs.push(Date.now());
 	};
 
-	/** Serialize settle handler behind an in-flight watchdog repair. */
-	async function waitForRepair(deadlineMs: number): Promise<void> {
+	/** Serialize settle handler behind an in-flight watchdog tick or repair.
+	 *  Without this, agent_before_settle and the watchdog can both decide to
+	 *  chargeBudget/sendUserMessage in the same outage. */
+	async function waitForTick(deadlineMs: number): Promise<void> {
 		const deadline = Date.now() + deadlineMs;
-		while (repairing && Date.now() < deadline) await sleep(500);
+		while ((ticking || repairing) && Date.now() < deadline) await sleep(250);
 	}
 
 	/** Push notifications (iPhone via Bark, generic webhook, macOS fallback).
@@ -374,7 +382,6 @@ export default function (pi: ExtensionAPI) {
 		}
 		repairing = true;
 		lastRepairAt = Date.now();
-		failedRepairs++;
 		try {
 			if (backend === "sakamoto") {
 				// Locate sakamoto.yaml relative to the discovered svc.sock; fall
@@ -404,13 +411,19 @@ export default function (pi: ExtensionAPI) {
 					notify(ctx,`sakamoto did not queue a switch (${status || "unknown"}); ManualPick and disabled fallback are never overridden.`,"warning");
 					return false;
 				}
-				notify(ctx,`sakamoto recovery ${status}; waiting for watcher-owned URL tests (no VPN restart)…`,"warning");
+				// Only a real queue/attempt counts against the repair cap. busy
+				// and cooldown mean the watcher is already working — piggyback
+				// on that effort instead of burning our budget.
+				if (status === "queued") failedRepairs++;
+				notify(ctx,`sakamoto recovery ${status}; waiting for watcher-owned URL tests (no VPN restart)…`, status === "queued" ? "warning" : "info");
 				await sleep(Math.max(0, SAKAMOTO_WAIT_MS));
 				if (token!==sessionToken) return false;
 				const check = await verifyRecovery(ctx);
 				if (!check.ok) log(`sakamoto watcher did not recover the Pi path: ${check.error ?? `HTTP ${check.status}`}`);
 				return check.ok;
 			}
+			// Legacy Shadowrocket path: every invocation counts.
+			failedRepairs++;
 			const recheck = async (): Promise<boolean> => {
 				await sleep(RECHECK_DELAY_MS);
 				const check = await verifyRecovery(ctx); // confirm sustained capacity twice
@@ -468,6 +481,9 @@ export default function (pi: ExtensionAPI) {
 			watchdog = setInterval(() => {
 				void (async () => {
 					if (ticking || busy || repairing || !sessionCtx) return;
+					// Exponential backoff while paused: cap at WATCHDOG_MAX_GAP_MS.
+					// Reset whenever we observe a healthy path or a fresh run starts.
+					if (pausedByUs && Date.now() < watchdogNextTickAt) return;
 					const token=sessionToken;
 					// Only spend effort when pi actually needs the connection:
 					// a live run (internal retries benefit) or a paused-by-us session.
@@ -477,6 +493,8 @@ export default function (pi: ExtensionAPI) {
 						const check = pausedByUs ? await verifyRecovery(sessionCtx) : await probe(sessionCtx, false);
 						if (token!==sessionToken || !sessionCtx) return;
 						if (check.ok) {
+							watchdogFailStreak = 0;
+							watchdogNextTickAt = 0;
 							// Recovered while paused: resume.
 							if (pausedByUs && !runActive) {
 								if (budgetLeft() <= 0) return;
@@ -487,6 +505,13 @@ export default function (pi: ExtensionAPI) {
 								pi.sendUserMessage(RESUME_TEXT, { deliverAs: "followUp" });
 							}
 							return;
+						}
+						// Down. Back off: after a few failed checks, probing every
+						// minute for hours produces noise without value.
+						if (pausedByUs) {
+							watchdogFailStreak++;
+							const gap = Math.min(WATCHDOG_MS * (1 << Math.min(watchdogFailStreak, 4)), WATCHDOG_MAX_GAP_MS);
+							watchdogNextTickAt = Date.now() + gap;
 						}
 						// Down: active repairs are capped at PAUSED_REPAIR_MAX per
 						// down-episode; afterwards we keep a cheap passive watch and
@@ -503,9 +528,12 @@ export default function (pi: ExtensionAPI) {
 						// Repairing the network is free — only resumes/continues spend
 						// provider requests, so the budget gates those, not the repair.
 						if (await repairProxy(sessionCtx)) {
+							if (token!==sessionToken) return;
 							if (pausedByUs && !runActive && budgetLeft() > 0) {
 								chargeBudget();
 								pausedByUs = false;
+								watchdogFailStreak = 0;
+								watchdogNextTickAt = 0;
 								notify(sessionCtx, "Proxy repaired — resuming paused session.");
 								if (NOTIFY_RESUME) systemNotify("proxy recovered — session resumed");
 								pi.sendUserMessage(RESUME_TEXT, { deliverAs: "followUp" });
@@ -535,12 +563,18 @@ export default function (pi: ExtensionAPI) {
 		backend = "none";
 		pausedByUs = false;
 		runActive = false;
+		watchdogFailStreak = 0;
+		watchdogNextTickAt = 0;
 	});
 
 	pi.on("agent_start", () => {
 		runActive = true;
 		runStartedAt = Date.now();
-		pausedByUs = false; // whoever started the run, a fresh attempt is underway
+		// Do NOT clear pausedByUs here. The run that just started may be the
+		// one we triggered via sendUserMessage — clearing the flag would make
+		// the watchdog lose ownership of the pause state and stop verifying.
+		// pausedByUs is cleared at the resume site (chargeBudget + sendUserMessage)
+		// and at session_start/shutdown, not by a fresh run.
 	});
 	pi.on("agent_settled", (_event, ctx) => {
 		runActive = false;
@@ -577,7 +611,9 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			consecutiveErrors++;
-			await waitForRepair(SHORTCUT_TIMEOUT_MS + 30_000);
+			// Wait for any in-flight watchdog tick or repair before deciding —
+			// otherwise both paths can race to sendUserMessage/chargeBudget.
+			await waitForTick(SHORTCUT_TIMEOUT_MS + 30_000);
 			if (token!==sessionToken) return;
 			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}`);
 			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.

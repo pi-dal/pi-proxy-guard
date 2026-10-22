@@ -216,3 +216,20 @@ test("recover waits for watcher, verifies deep path and then continues",async()=
     assert.equal(h.messages.length,0);
   } finally {await h.shutdown();}
 });
+
+test("sakamoto 'busy'/'cooldown' replies do not burn the repair budget",async()=>{
+  // busy means the watcher is already mid-test; cooldown means it recently
+  // ran. Neither should count as our failed repair — otherwise repeated
+  // requests during a wedged watcher exhaust PAUSED_REPAIR_MAX without ever
+  // actually trying to switch.
+  for (const reply of ["busy","cooldown"]) {
+    const h=await makeHarness("connected","recover",2,0,0,reply);
+    try {
+      await h.handlers.get("agent_before_settle")?.(boundary("Retry failed after 5 attempts"),h.ctx);
+      // failedRepairs must stay 0 — visible via /proxyguard status.
+      await h.commands.get("proxyguard")?.("status",h.ctx);
+      const status=h.notices.at(-1)??"";
+      assert.match(status,/failedRepairs=0\//);
+    } finally {await h.shutdown();}
+  }
+});
