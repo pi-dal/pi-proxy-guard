@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { chooseBackend, classifyProviderError, isLoopbackApiUrl, shouldAttemptRecovery, transferHealthy, transportReached } from "../extensions/recovery-policy.ts";
+import { chooseBackend, classifyProviderError, isLoopbackApiUrl, isLoopbackApiUrlLocal, loopbackUpstreamKind, shouldAttemptRecovery, shouldDeepProbe, transferHealthy, transportReached } from "../extensions/recovery-policy.ts";
 import { findSupervisorSocket, supervisorStatus } from "../extensions/sakamoto-adapter.ts";
 
 test("sakamoto is preferred; Shadowrocket is never an implicit fallback", () => {
@@ -82,6 +82,28 @@ test("proxy 502 and small error pages never pass sustained transfer", () => {
 	assert.equal(transferHealthy(502, 65_536, 60_000), false);
 	assert.equal(transferHealthy(200, 512, 60_000), false);
 	assert.equal(transferHealthy(429, 65_536, 60_000), false);
+});
+
+test("loopback upstream classification: magpie-style remote gateway vs local model server", () => {
+	// Remote loopback gateway (magpie dials out through the VPN) — the
+	// default: no local-upstream probe configured.
+	assert.equal(loopbackUpstreamKind("http://127.0.0.1:3425/v1", undefined), "remote");
+	// Same-host upstream probe marks it local (llama.cpp/Ollama-style).
+	assert.equal(loopbackUpstreamKind("http://127.0.0.1:3425/v1", "http://127.0.0.1:8080/health"), "local");
+	assert.equal(isLoopbackApiUrlLocal("http://127.0.0.1:3425/v1", "http://localhost:8080/"), false); // hostname must match literally
+	// A probe on another host is unusable → unknown (conservative).
+	assert.equal(loopbackUpstreamKind("http://127.0.0.1:3425/v1", "http://192.168.1.5:8080/"), "unknown");
+	// Non-loopback targets have no upstream kind.
+	assert.equal(loopbackUpstreamKind("https://api.openai.com/v1", "http://127.0.0.1:8080/"), undefined);
+});
+
+test("a lone network settle never spends a deep probe", () => {
+	assert.equal(shouldDeepProbe("network", 1, false, 2), false);
+	assert.equal(shouldDeepProbe("network", 2, false, 2), true);
+	assert.equal(shouldDeepProbe("network", 1, true, 2), true); // watchdog saw the path fail mid-run
+	assert.equal(shouldDeepProbe("provider", 9, true, 2), false);
+	assert.equal(shouldDeepProbe("unknown", 9, true, 2), false);
+	assert.equal(shouldDeepProbe("network", 1, false, 1), true); // min=1 restores hair-trigger
 });
 
 test("supervisor adapter only issues a read-only status request", async () => {

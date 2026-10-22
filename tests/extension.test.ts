@@ -57,6 +57,9 @@ case " $* " in *"__down"*) printf '200 65536';; *) printf '204';; esac
     PI_PROXY_GUARD_API_URL:"https://user:private-test-token@api.test.invalid/v1?key=private-test-token",
     PI_PROXY_GUARD_PROXY:"http://user:private-test-token@127.0.0.1:2334",
     PI_PROXY_GUARD_SAKAMOTO_MODE:mode,
+    // Tests assert on a single settle: keep the deep-probe trigger at the
+    // legacy hair-trigger so each boundary case runs once.
+    PI_PROXY_GUARD_MIN_CONSECUTIVE_ERRORS:"1",
     PI_PROXY_GUARD_SAKAMOTO_WAIT_MS:String(waitMs),
     PI_PROXY_GUARD_PROBE_ATTEMPTS:"2",
     PI_PROXY_GUARD_PROBE_GAP_MS:"0",
@@ -231,5 +234,51 @@ test("sakamoto 'busy'/'cooldown' replies do not burn the repair budget",async()=
       const status=h.notices.at(-1)??"";
       assert.match(status,/failedRepairs=0\//);
     } finally {await h.shutdown();}
+  }
+});
+
+test("a single network settle without evidence is left alone (default threshold)",async()=>{
+  // MIN_CONSECUTIVE_ERRORS defaults to 2: a lone stream cut that reaches
+  // settle is usually an upstream abort the proxy cannot fix — probing
+  // anyway is what made the guard feel twitchy.
+  const dir=mkdtempSync(join(tmpdir(),"pi-guard-threshold-"));
+  const server:Server=createServer((conn)=>conn.once("data",()=>conn.end("connected pid=1 up=1s\n")));
+  await new Promise<void>((resolve,reject)=>server.listen(join(dir,"svc.sock"),resolve).once("error",reject));
+  const callLog=join(dir,"curl-calls");
+  const backup={...process.env};
+  Object.assign(process.env,{
+    SAKAMOTO_DIR:dir,
+    PI_PROXY_GUARD_BACKEND:"sakamoto",
+    PI_PROXY_GUARD_SAKAMOTO_MODE:"recover",
+    PI_PROXY_GUARD_NOTIFY:"0",
+    PI_PROXY_GUARD_WATCHDOG_MS:"0",
+    PI_PROXY_GUARD_LOG:"",
+    FAKE_CALL_LOG:callLog,
+  });
+  delete process.env.PI_PROXY_GUARD_MIN_CONSECUTIVE_ERRORS;
+  const curl=join(dir,"curl");
+  writeFileSync(curl,`#!/bin/sh\nprintf '%s\\n' curl >> "$FAKE_CALL_LOG"\ncase " $* " in *"__down"*) printf '200 65536';; *) printf '204';; esac\n`);
+  chmodSync(curl,0o755);
+  process.env.PATH=dir+":"+process.env.PATH;
+  const handlers=new Map<string,(...args:any[])=>any>();
+  const pi={on:(n:string,fn:(...a:any[])=>any)=>{handlers.set(n,fn);return ()=>{};},registerCommand:()=>{},sendUserMessage:()=>{}};
+  try {
+    const ext=await import(`../extensions/proxy-guard.ts?threshold=${++sequence}`);
+    ext.default(pi);
+    const ctx={hasUI:true,ui:{notify:()=>{}},model:{baseUrl:"https://api.test.invalid/v1"},isIdle:()=>true};
+    await handlers.get("session_start")?.({},ctx);
+    const first=await handlers.get("agent_before_settle")?.(boundary("ECONNRESET"),ctx);
+    assert.equal(first,undefined);
+    assert.equal(lines(callLog),0); // no probes spent on a lone error
+    // Second consecutive error clears the threshold and probes.
+    const second=await handlers.get("agent_before_settle")?.(boundary("ECONNRESET"),ctx);
+    assert.equal(second?.continue,true);
+    assert.ok(lines(callLog)>0);
+  } finally {
+    await handlers.get("session_shutdown")?.();
+    await new Promise<void>((resolve)=>server.close(()=>resolve()));
+    rmSync(dir,{recursive:true,force:true});
+    for (const key of Object.keys(process.env)) if (!(key in backup)) delete process.env[key];
+    Object.assign(process.env,backup);
   }
 });

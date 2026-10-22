@@ -7,11 +7,14 @@ A [Pi](https://github.com/earendil-works/pi) extension that recovers **network-f
 | Evidence | Action |
 |---|---|
 | Quota, authentication, permission, or unknown error | Stay paused. Never change the proxy or automatically repeat a provider request. |
+| A **single** network/stream settle with no corroborating transport evidence | Ignore it. Pi's own provider retries usually absorb transient cuts, and upstream mid-stream aborts look identical to local proxy death — probing anyway is what makes the guard feel twitchy. |
+| Network/stream error, **consecutive** (default 2) or confirmed by a mid-run watchdog probe failure | Deep-check the Pi path, then act on the result below. |
 | Classified network/stream error; deep Pi path works twice | Continue once after a short backoff. |
 | Repeated deep Pi-path failure; sakamoto **observe** mode (default) | Stay paused while sakamoto's independent watcher works. Deep-check again later; never restart or select a node. |
 | Repeated deep failure; sakamoto **recover** mode | Call `sakamoto recover` once, wait for watcher-owned URL tests (default 45s), then require two fresh deep successes before continuing. If still down, stay paused and notify. |
 | Sakamoto supervisor deliberately disconnected | Do not start the VPN. Stay paused until the user connects it. |
-| API target is loopback (e.g. a local gateway such as magpie on `127.0.0.1:3425`) | Proxy recovery cannot apply and never runs — no tunnel gate, no sustained-transfer check. Stay paused; deep probes auto-resume when the endpoint answers. |
+| Loopback API target whose upstream is **remote** (e.g. magpie on `127.0.0.1:3425` forwarding to cloud providers through the VPN) | Treat the gateway like any remote endpoint: probe the local endpoint directly first (proxy bypassed — a dead proxy must not mask "the gateway is back"), then require the internet path (generate_204 + sustained transfer) before resuming. VPN repair applies. |
+| Loopback API target whose upstream is **fully local** (llama.cpp/Ollama-style; opt in via `PI_PROXY_GUARD_LOCAL_UPSTREAM_URL`) | Proxy state is irrelevant — probe only the local upstream endpoint and auto-resume on its recovery. VPN repair never runs. |
 
 A deep check queries the active model API host for transport reachability and downloads at least 60 KB from an independent endpoint. A cheap 204 probe alone cannot resume a paused session. Three consecutive failed attempts (default) avoid switching because of one latency spike. A verified recovery must pass **two** sustained-transfer checks. Provider-request budgets, repair cooldowns and passive monitoring remain in force.
 
@@ -59,6 +62,10 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 | `PI_PROXY_GUARD_SAKAMOTO_BIN` | `sakamoto` | CLI invoked with `recover`; on PATH miss it falls back to `/opt/homebrew/bin/sakamoto` then `/usr/local/bin/sakamoto`. No API secret is passed. |
 | `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | Cheap watchdog probe; requires HTTP 2xx. |
 | `PI_PROXY_GUARD_API_URL` | current model base URL | API host for a deep transport check; 5xx is not a successful path. |
+| `PI_PROXY_GUARD_LOCAL_API_URL` | `PI_PROXY_GUARD_API_URL` | When the API target is loopback, this is the endpoint probed for "is the gateway alive". Curl bypasses the proxy for it. |
+| `PI_PROXY_GUARD_LOCAL_UPSTREAM_URL` | unset | Optional same-host probe for a **fully local** upstream (llama.cpp, Ollama, …). Setting it reclassifies the loopback target: only this endpoint is probed and VPN repair never runs. Leave unset for magpie-style remote gateways. |
+| `PI_PROXY_GUARD_MIN_CONSECUTIVE_ERRORS` | `2` | Consecutive network settle errors required before a deep probe / repair is considered. `1` restores the original hair-trigger. |
+| `PI_PROXY_GUARD_NETWORK_EVIDENCE` | `1` | `0` ignores the watchdog's mid-run transport-failure signal as settle evidence; by default it lets a single error settle trigger the deep path immediately. |
 | `PI_PROXY_GUARD_STREAM_URL` | Cloudflare 64 KB download | Sustained-transfer target; must return 2xx and enough bytes. |
 | `PI_PROXY_GUARD_STREAM_MIN_BYTES` | `60000` | Minimum successful bytes; `0` disables transfer verification (less safe). |
 | `PI_PROXY_GUARD_PROXY` | process proxy environment | Optional explicit curl proxy; use Pi's actual path. |

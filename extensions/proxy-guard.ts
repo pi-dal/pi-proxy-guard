@@ -3,10 +3,13 @@
  * backend when its local supervisor socket exists. Shadowrocket repair requires
  * the explicit PI_PROXY_GUARD_BACKEND=shadowrocket legacy setting.
  *
- * Only a classified network/stream error may trigger recovery. Three spaced
- * attempts check the Pi API host and a sustained transfer on the same proxy
- * path; two independent deep successes are required before continuing Pi.
- * Quota/auth/unclassified errors stay paused without switching anything.
+ * Only a classified network/stream error may trigger recovery, and only
+ * after it repeats (default: 2 consecutive error settles) or a mid-run
+ * watchdog probe fails — a lone transient is usually upstream, not the
+ * proxy. Three spaced attempts check the Pi API host and a sustained
+ * transfer on the same proxy path; two independent deep successes are
+ * required before continuing Pi. Quota/auth/unclassified errors stay
+ * paused without switching anything.
  *
  * With sakamoto, this extension never selects a node, starts/stops a VPN, or
  * reads the native API secret. The existing sakamoto watcher exclusively owns
@@ -30,7 +33,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { chooseBackend, classifyProviderError, isLoopbackApiUrl, shouldAttemptRecovery, transferHealthy, transportReached, type Backend } from "./recovery-policy.ts";
+import { chooseBackend, classifyProviderError, isLoopbackApiUrl, loopbackUpstreamKind, shouldAttemptRecovery, shouldDeepProbe, transferHealthy, transportReached, type Backend } from "./recovery-policy.ts";
 import { findSupervisorSocket, supervisorStatus } from "./sakamoto-adapter.ts";
 
 /** Shell rc files occasionally wrap a value in literal quotes
@@ -46,6 +49,24 @@ function envStr(name: string, fallback = ""): string {
 const DISABLED = envStr("PI_PROXY_GUARD") === "0";
 const CHECK_URL = envStr("PI_PROXY_GUARD_URL", "https://www.google.com/generate_204");
 const API_URL_OVERRIDE = envStr("PI_PROXY_GUARD_API_URL") || undefined;
+/** Where the guard should probe for "is the thing Pi calls alive" when the
+ *  configured API target is loopback. Defaults to the loopback target itself
+ *  — the gateway answering at all is the local reachability signal. */
+const LOCAL_API_URL = envStr("PI_PROXY_GUARD_LOCAL_API_URL") || API_URL_OVERRIDE || undefined;
+/** Optional probe URL for a fully-local upstream behind the gateway
+ *  (llama.cpp, Ollama, …) on the same host. Setting it marks the loopback
+ *  target `local` instead of the default `remote` (magpie-style gateway
+ *  whose upstream rides the VPN). */
+const LOCAL_UPSTREAM_URL = envStr("PI_PROXY_GUARD_LOCAL_UPSTREAM_URL") || undefined;
+/** A single network-flavored settle error is weak evidence: pi's internal
+ *  provider retries already absorbed the first transient cut, and upstream
+ *  mid-stream aborts reach settle looking identical to local proxy death.
+ *  Default 2 consecutive network settles before we spend a deep probe or
+ *  touch the proxy; set 1 for the old hair-trigger behavior. */
+const MIN_CONSECUTIVE_ERRORS = Math.max(1, Number(process.env.PI_PROXY_GUARD_MIN_CONSECUTIVE_ERRORS ?? 2));
+/** `0` ignores the mid-run watchdog flag; by default a watchdog probe that
+ *  fails *during* an active run also unlocks the deep check on settle. */
+const USE_NETWORK_EVIDENCE = process.env.PI_PROXY_GUARD_NETWORK_EVIDENCE !== "0";
 const STREAM_URL = envStr("PI_PROXY_GUARD_STREAM_URL", "https://speed.cloudflare.com/__down?bytes=65536");
 const STREAM_MIN_BYTES = Number(process.env.PI_PROXY_GUARD_STREAM_MIN_BYTES ?? 60_000);
 const VPN_SERVICE = envStr("PI_PROXY_GUARD_VPN_SERVICE");
@@ -116,10 +137,8 @@ const LOG_FILE = (() => {
 })();
 
 const NUDGE_CUSTOM_TYPE = "proxy-guard-recovery";
-const NUDGE_TEXT =
-	"[proxy-guard] The previous model request failed with a network error (stream cut, retries exhausted). " +
-	"Connectivity has been verified again. Continue exactly where you left off.";
-const RESUME_TEXT = "[proxy-guard] connection verified — please resume where you left off";
+const NUDGE_TEXT = "The previous request was interrupted. Continue exactly where you left off.";
+const RESUME_TEXT = "continue";
 
 function originLabel(value: string | undefined): string {
 	if (!value) return "(none)";
@@ -178,13 +197,21 @@ async function execFirst(candidates: string[], args: string[], timeoutMs: number
 	return last;
 }
 
+/** curl proxy args for a target URL. A loopback target never benefits
+ *  from the HTTP proxy — forcing one would blackhole it exactly when
+ *  the proxy is the broken thing we're diagnosing. `--noproxy '*'` also
+ *  overrides any inherited http_proxy env for that call. */
+function proxyArgs(url: string): string[] {
+	return isLoopbackApiUrl(url) ? ["--noproxy", "*"] : CHECK_PROXY ? ["-x", CHECK_PROXY] : [];
+}
+
 /** Reachability probe: any HTTP response (even 404/401/502) means the
  *  transport path to the host is alive — that's what we measure, not
  *  whether the endpoint "succeeds". */
 function httpProbe(url: string, requireSuccess = false): Promise<CheckResult> {
 	return new Promise((resolve) => {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
-		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
+		args.push(...proxyArgs(url));
 		args.push(url);
 		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000, killSignal: "SIGKILL" }, (err, stdout) => {
 			const status = Number.parseInt((stdout ?? "").trim(), 10);
@@ -200,7 +227,7 @@ function httpProbe(url: string, requireSuccess = false): Promise<CheckResult> {
 function streamProbe(url: string): Promise<CheckResult> {
 	return new Promise((resolve) => {
 		const args = ["-sS", "-o", "/dev/null", "-w", "%{http_code} %{size_download}", "--max-time", String(Math.ceil(CHECK_TIMEOUT_MS / 1000))];
-		if (CHECK_PROXY) args.push("-x", CHECK_PROXY);
+		args.push(...proxyArgs(url));
 		args.push(url);
 		execFile("curl", args, { timeout: CHECK_TIMEOUT_MS + 2_000, killSignal: "SIGKILL" }, (err, stdout) => {
 			const [statusRaw, bytesRaw] = (stdout ?? "").trim().split(/\s+/);
@@ -240,6 +267,10 @@ export default function (pi: ExtensionAPI) {
 	let pausedByUs = false;
 	/** True while an agent run is live (agent_start .. agent_settled). */
 	let runActive = false;
+	/** Set by the watchdog when a probe fails while a run is live — real
+	 *  transport trouble this turn, which lets settle skip the
+	 *  consecutive-error threshold. */
+	let runNetworkEvidence = false;
 	/** Repairs attempted since the last successful probe (per down-episode). */
 	let failedRepairs = 0;
 	let gaveUpNotified = false;
@@ -344,23 +375,50 @@ export default function (pi: ExtensionAPI) {
 	 *  deep=false (watchdog): cheap generate_204 ping only. */
 	async function probe(ctx?: ExtensionContext, deep = false, resetEpisode = true): Promise<CheckResult> {
 		const target = (deep ? (API_URL_OVERRIDE ?? ctx?.model?.baseUrl) : undefined) ?? CHECK_URL;
-		// A loopback API target (a local gateway such as magpie) is not reached
-		// through the VPN: skip the tunnel gate and the sustained-transfer check
-		// — a dead proxy must not mask "the local gateway is back up".
-		const loopback = deep && isLoopbackApiUrl(target);
-		if (!loopback) {
+		const upstream = loopbackUpstreamKind(target, LOCAL_UPSTREAM_URL);
+		if (upstream === "local") {
+			// Fully-local upstream (e.g. a local model server behind the
+			// gateway): proxy state is irrelevant — the only question is
+			// whether the local endpoint answers. One attempt, no tunnel
+			// gate, no sustained-transfer check.
+			const last = await httpProbe(LOCAL_UPSTREAM_URL ?? target, false);
+			if (last.ok && deep && resetEpisode) {failedRepairs=0;gaveUpNotified=false;}
+			return last;
+		}
+		if (upstream === "remote") {
+			// Remote gateway on loopback (e.g. magpie): the process answering
+			// is required, but it also dials out through the VPN — so after
+			// the endpoint responds we still verify the real internet path
+			// (generate_204 + sustained transfer). A dead proxy otherwise
+			// masquerades as "gateway is up".
+			const gate = await httpProbe(LOCAL_API_URL ?? target, false);
+			if (!gate.ok) return gate;
+		}
+		// upstream === "unknown" (loopback, no hint): legacy probe-less
+		// behavior — only the supervisor gate below runs, then the caller
+		// treats the path as verified once the tunnel is up.
+		if (upstream !== "local") {
 			const vpn = await tunnelUp(backend, supervisorSocket);
 			if (vpn === false) return { ok: false, repairable: backend !== "sakamoto", error: backend === "sakamoto" ? "sakamoto supervisor is not connected" : `VPN tunnel "${VPN_SERVICE}" disconnected` };
 		}
+		if (upstream === "unknown") {
+			// Nothing safe to curl (the API host is loopback and the caller
+			// gave no internet-side target): tunnel-up is our best signal.
+			const last: CheckResult = { ok: true };
+			if (deep && resetEpisode) {failedRepairs=0;gaveUpNotified=false;}
+			return last;
+		}
+		const internetTarget = upstream === "remote" ? CHECK_URL : target;
 		let last: CheckResult = { ok: false };
 		for (let attempt = 1; attempt <= PROBE_ATTEMPTS; attempt++) {
 			// deep=false (watchdog ping): require 2xx from generate_204 — a
 			// 502 means the proxy itself is broken even though TCP worked.
-			// deep=true (API host): any HTTP response <500 counts — 401/404
+			// deep=true (API host or, for a remote loopback gateway,
+			// generate_204): any HTTP response <500 counts — 401/404
 			// prove the transport reached the upstream (that's what we're
 			// measuring), 5xx means the proxy/upstream is still broken.
-			last = await httpProbe(target, !deep);
-			if (last.ok && deep && !loopback && STREAM_MIN_BYTES > 0) {
+			last = await httpProbe(internetTarget, !deep);
+			if (last.ok && deep && STREAM_MIN_BYTES > 0) {
 				const stream = await streamProbe(STREAM_URL);
 				if (!stream.ok) last = stream;
 			}
@@ -394,9 +452,12 @@ export default function (pi: ExtensionAPI) {
 	 * for its existing URLTest/fallback interval, but never writes a selector. */
 	async function repairProxy(ctx: ExtensionContext): Promise<boolean> {
 		const token=sessionToken;
-		// Loopback API targets are unreachable by definition of VPN repair.
-		if (isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
-			log("loopback API target — proxy repair skipped");
+		const upstream = loopbackUpstreamKind(API_URL_OVERRIDE ?? ctx.model?.baseUrl, LOCAL_UPSTREAM_URL);
+		// Only a fully-local upstream is unreachable by VPN repair; a remote
+		// gateway on loopback still dials out through the tunnel. `unknown`
+		// has no safe repair target either.
+		if (upstream === "local" || upstream === "unknown") {
+			log(`loopback API target (${upstream}) — proxy repair skipped`);
 			return false;
 		}
 		if (backend === "none" || (backend === "sakamoto" && SAKAMOTO_MODE !== "recover")) return false;
@@ -520,6 +581,7 @@ export default function (pi: ExtensionAPI) {
 						const check = pausedByUs ? await verifyRecovery(sessionCtx) : await probe(sessionCtx, false);
 						if (token!==sessionToken || !sessionCtx) return;
 						if (check.ok) {
+							runNetworkEvidence = false;
 							watchdogFailStreak = 0;
 							watchdogNextTickAt = 0;
 							// Recovered while paused: resume.
@@ -539,6 +601,11 @@ export default function (pi: ExtensionAPI) {
 							watchdogFailStreak++;
 							const gap = Math.min(WATCHDOG_MS * (1 << Math.min(watchdogFailStreak, 4)), WATCHDOG_MAX_GAP_MS);
 							watchdogNextTickAt = Date.now() + gap;
+						} else if (runActive) {
+							// Cheap ping failed mid-run: flag real transport
+							// trouble so a subsequent settle error doesn't
+							// have to wait for the consecutive-error threshold.
+							runNetworkEvidence = true;
 						}
 						// Down: active repairs are capped at PAUSED_REPAIR_MAX per
 						// down-episode; afterwards we keep a cheap passive watch and
@@ -604,6 +671,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", () => {
 		runActive = true;
 		runStartedAt = Date.now();
+		runNetworkEvidence = false;
 		// Do NOT clear pausedByUs here. The run that just started may be the
 		// one we triggered via sendUserMessage — clearing the flag would make
 		// the watchdog lose ownership of the pause state and stop verifying.
@@ -654,23 +722,31 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			consecutiveErrors++;
+			const evidence = USE_NETWORK_EVIDENCE && runNetworkEvidence;
 			// Wait for any in-flight watchdog tick or repair before deciding —
 			// otherwise both paths can race to sendUserMessage/chargeBudget.
 			// Deadline must exceed the worst-case repairProxy duration:
 			// execFirst (3×5s) + SAKAMOTO_WAIT_MS (45s) + verifyRecovery (~2×64s).
 			await waitForTick(SAKAMOTO_WAIT_MS + CHECK_TIMEOUT_MS * PROBE_ATTEMPTS * 2 + 60_000);
 			if (token!==sessionToken) return;
-			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}`);
-			// Loopback API target (local gateway like magpie) — proxy recovery
-			// cannot reach it. Pause and let the watchdog's deep probes
-			// auto-resume once the local endpoint answers. Check this BEFORE
-			// burning a verifyRecovery pass that can only fail.
-			if (isLoopbackApiUrl(API_URL_OVERRIDE ?? ctx.model?.baseUrl)) {
-				pausedByUs = true;
-				notify(ctx, "API target is loopback — proxy recovery cannot apply. Pausing; auto-resume once the local endpoint answers.", "warning");
+			log(`network settle #${consecutiveErrors}; canContinue=${event.context.canContinue}; budget=${budgetLeft()}/${MAX_REPAIRS}; backend=${backend}; evidence=${evidence}`);
+			// One network settle is weak evidence — pi's own retries usually
+			// absorb transient cuts, and upstream mid-stream aborts look
+			// identical to local proxy death. Without a streak or an in-run
+			// watchdog failure, leave it alone.
+			if (!shouldDeepProbe(kind, consecutiveErrors, evidence, MIN_CONSECUTIVE_ERRORS)) {
+				log(`settle skipped: single network error, no corroborating evidence (need ${MIN_CONSECUTIVE_ERRORS} consecutive or watchdog evidence)`);
 				return;
 			}
-			const check = await verifyRecovery(ctx); // API host plus two sustained transfers.
+			const upstreamKind = loopbackUpstreamKind(API_URL_OVERRIDE ?? ctx.model?.baseUrl, LOCAL_UPSTREAM_URL);
+			// A fully-local upstream can never be a proxy problem — pause on
+			// the local endpoint and let its own probe drive auto-resume.
+			if (upstreamKind === "local") {
+				pausedByUs = true;
+				notify(ctx, "API target is local — proxy recovery cannot apply. Pausing; auto-resume once the local endpoint answers.", "warning");
+				return;
+			}
+			const check = await verifyRecovery(ctx); // transport reachability plus two sustained transfers
 			if (token!==sessionToken) return;
 			if (budgetLeft() <= 0) {
 				pausedByUs = !check.ok;
