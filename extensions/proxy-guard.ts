@@ -57,6 +57,11 @@ const BACKEND_REQUEST = envStr("PI_PROXY_GUARD_BACKEND") || undefined;
 const SAKAMOTO_MODE = envStr("PI_PROXY_GUARD_SAKAMOTO_MODE") === "recover" ? "recover" : "observe";
 const SAKAMOTO_WAIT_MS = Number(process.env.PI_PROXY_GUARD_SAKAMOTO_WAIT_MS ?? 45_000);
 const SAKAMOTO_BIN = envStr("PI_PROXY_GUARD_SAKAMOTO_BIN", "sakamoto");
+/** Fallback candidates if PATH lookup fails. Homebrew's default prefix on
+ *  Apple Silicon is /opt/homebrew; Intel macs use /usr/local. The user's
+ *  interactive shell rc usually adds these to PATH, but pi's extension
+ *  host may not inherit them. */
+const SAKAMOTO_BIN_CANDIDATES = [SAKAMOTO_BIN, "/opt/homebrew/bin/sakamoto", "/usr/local/bin/sakamoto"];
 const SHORTCUT = envStr("PI_PROXY_GUARD_SHORTCUT", "Reconnect Shadowrocket");
 const SHORTCUT_TIMEOUT_MS = Number(process.env.PI_PROXY_GUARD_SHORTCUT_TIMEOUT_MS ?? 120_000);
 const USE_SCHEME = process.env.PI_PROXY_GUARD_SCHEME !== "0";
@@ -136,6 +141,19 @@ function execCmd(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: 
 	});
 }
 
+/** Try candidates in order until one spawns; last error wins. Needed because
+ *  pi's extension host may have a PATH that doesn't include /opt/homebrew/bin,
+ *  turning `sakamoto recover` into a silent ENOENT that looks identical to
+ *  "watcher refused". */
+async function execFirst(candidates: string[], args: string[], timeoutMs: number): Promise<{ ok: boolean; output?: string; error?: string }> {
+	let last: { ok: boolean; output?: string; error?: string } = { ok: false, error: "no candidates" };
+	for (const cmd of candidates) {
+		last = await execCmd(cmd, args, timeoutMs);
+		if (last.ok || (last.error && !last.error.includes("ENOENT"))) return last;
+	}
+	return last;
+}
+
 /** Reachability probe: any HTTP response (even 404/401/502) means the
  *  transport path to the host is alive — that's what we measure, not
  *  whether the endpoint "succeeds". */
@@ -212,6 +230,10 @@ export default function (pi: ExtensionAPI) {
 	let ticking = false;
 	let lastRepairAt = 0;
 	let lastNotifyAt = 0;
+	/** UI-notification throttle (independent of push cooldown): avoids a
+	 *  banner storm when a condition repeats every repair cycle. */
+	let lastUiNotifyAt = 0;
+	const UI_NOTIFY_COOLDOWN_MS = 60_000;
 	let runStartedAt = 0;
 	/** outcome of the most recent settle boundary; agent_settled has none. */
 	let lastSettleOutcome = "";
@@ -355,10 +377,29 @@ export default function (pi: ExtensionAPI) {
 		failedRepairs++;
 		try {
 			if (backend === "sakamoto") {
-				const request=await execCmd(SAKAMOTO_BIN,["recover"],5_000);
+				// Locate sakamoto.yaml relative to the discovered svc.sock; fall
+				// back to the CLI default when the socket path isn't available
+				// (e.g. SAKAMOTO_DIR unset and sock missing at startup).
+				const cfgPath = supervisorSocket ? join(dirname(supervisorSocket),"sakamoto.yaml") : undefined;
+				const args = cfgPath ? ["-config",cfgPath,"recover"] : ["recover"];
+				const request=await execFirst(SAKAMOTO_BIN_CANDIDATES,args,5_000);
 				if (token!==sessionToken) return false;
 				if (!request.ok) {notify(ctx,`sakamoto recovery trigger unavailable: ${request.error}`,"warning");return false;}
 				const status=(request.output??"").trim();
+				if (status === "unavailable") {
+					// watcher is alive but its groups snapshot is missing — usually
+					// sing-box is mid-restart or the API is down. Loud warning: the
+					// guard cannot recover anything until watcher itself is healthy.
+					// Throttled UI banner: every repeat attempt would otherwise re-pop.
+					if (Date.now() - lastUiNotifyAt > UI_NOTIFY_COOLDOWN_MS) {
+						lastUiNotifyAt = Date.now();
+						notify(ctx,"sakamoto watcher reports unavailable — sing-box API may be restarting. Check `tail ~/.config/sakamoto/logs/watch.out.log`.","error");
+					} else {
+						log("sakamoto watcher still unavailable (ui notification throttled)");
+					}
+					systemNotify("sakamoto watcher unavailable — check sing-box");
+					return false;
+				}
 				if (!["queued","busy","cooldown"].includes(status)) {
 					notify(ctx,`sakamoto did not queue a switch (${status || "unknown"}); ManualPick and disabled fallback are never overridden.`,"warning");
 					return false;

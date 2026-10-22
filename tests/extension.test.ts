@@ -161,7 +161,7 @@ test("a manual selection is never overwritten by a trigger",async()=>{
   try {
     const result=await h.handlers.get("agent_before_settle")?.(boundary("ECONNRESET"),h.ctx);
     assert.equal(result,undefined);
-    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
+    assert.match(readFileSync(h.sakamotoLog,"utf8"),/\brecover\b/);
     assert.equal(lines(h.shadowLog),0);
     assert.ok(h.notices.some((x)=>x.includes("manual")));
   } finally {await h.shutdown();}
@@ -185,7 +185,7 @@ test("a broken chained path stays paused rather than cycling nodes",async()=>{
     assert.equal(result,undefined);
     assert.equal(h.messages.length,0);
     assert.equal(lines(h.shadowLog),0);
-    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
+    assert.match(readFileSync(h.sakamotoLog,"utf8"),/\brecover\b/);
     assert.ok(h.socketCommands.length>0 && h.socketCommands.every((command)=>command==="status\n"));
     assert.ok(h.notices.some((x)=>x.includes("still down")));
   } finally {await h.shutdown();}
@@ -211,7 +211,7 @@ test("recover waits for watcher, verifies deep path and then continues",async()=
     assert.equal(result?.entries?.[0]?.type,"custom_message");
     assert.ok(lines(h.callLog)>=4);
     assert.equal(lines(h.shadowLog),0);
-    assert.equal(readFileSync(h.sakamotoLog,"utf8"),"recover\n");
+    assert.match(readFileSync(h.sakamotoLog,"utf8"),/\brecover\b/);
     assert.ok(h.socketCommands.every((command)=>command==="status\n"));
     assert.equal(h.messages.length,0);
   } finally {await h.shutdown();}

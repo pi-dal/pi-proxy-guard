@@ -56,7 +56,7 @@ The guard sends a single `sakamoto recover` request after confirmed failure. A u
 | `PI_PROXY_GUARD_BACKEND` | `auto` | `auto` finds sakamoto's local supervisor; `sakamoto` requires it; `shadowrocket` explicitly enables legacy repair; `none` never repairs. |
 | `PI_PROXY_GUARD_SAKAMOTO_MODE` | `observe` | `recover` waits for watcher-owned fallback, without selector or VPN writes. |
 | `PI_PROXY_GUARD_SAKAMOTO_WAIT_MS` | `45000` | Wait for triggered URL tests and settle cycle. |
-| `PI_PROXY_GUARD_SAKAMOTO_BIN` | `sakamoto` | CLI executable invoked with `recover`; no API secret is passed. |
+| `PI_PROXY_GUARD_SAKAMOTO_BIN` | `sakamoto` | CLI invoked with `recover`; on PATH miss it falls back to `/opt/homebrew/bin/sakamoto` then `/usr/local/bin/sakamoto`. No API secret is passed. |
 | `PI_PROXY_GUARD_URL` | `https://www.google.com/generate_204` | Cheap watchdog probe; requires HTTP 2xx. |
 | `PI_PROXY_GUARD_API_URL` | current model base URL | API host for a deep transport check; 5xx is not a successful path. |
 | `PI_PROXY_GUARD_STREAM_URL` | Cloudflare 64 KB download | Sustained-transfer target; must return 2xx and enough bytes. |
